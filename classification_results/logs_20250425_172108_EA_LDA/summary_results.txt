@@ -1,0 +1,9 @@
+inter_subject=None
+loso={'CH': 0.7666666666666667, 'CY': 0.8087719298245614, 'JXW': 0.6003445305770887, 'LAM': 0.6350877192982456, 'LM': 0.7231481481481481, 'SZW': 0.7657407407407407, 'XX': 0.6036231884057971, 'YJM': 0.5687702265372169, 'ZJH': 0.7992424242424242}
+overall_loso=0.6968217304934321
+intra_subject={}
+overall_intra_subject=None
+intra_session={}
+overall_intra_session=None
+subject_details={'CH': {'sessions': 12, 'trials': 1320}, 'CY': {'sessions': 12, 'trials': 1140}, 'JXW': {'sessions': 12, 'trials': 1161}, 'LAM': {'sessions': 12, 'trials': 1140}, 'LM': {'sessions': 12, 'trials': 1080}, 'SZW': {'sessions': 12, 'trials': 1080}, 'XX': {'sessions': 12, 'trials': 1380}, 'YJM': {'sessions': 12, 'trials': 1236}, 'ZJH': {'sessions': 12, 'trials': 1320}}
+incremental_loso={}

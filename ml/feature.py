@@ -15,6 +15,14 @@ from xgboost import XGBClassifier
 import random
 import sys
 import os
+import importlib.util
+
+# load load_subject_data from tl.py
+tl_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'tl.py')
+spec = importlib.util.spec_from_file_location('tl_file', tl_path)
+tl_file = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(tl_file)
+load_subject_data = tl_file.load_subject_data
 
 from utils.alg_utils import EA
 from utils.data_utils import traintest_split_cross_subject
@@ -36,94 +44,38 @@ def apply_zscore(train_x, test_x, num_subjects):
 
 
 def data_process(dataset):
-    '''
-    :param dataset: str, dataset name
-    :return: X, y, num_subjects, paradigm, sample_rate
-    '''
+    """
+    :param dataset: str, full path to root folder of your MAT datasets
+    :return: X, y, num_subjects, paradigm, sample_rate, ch_num
+    """
     mne.set_log_level('warning')
-
-    if dataset == 'BNCI2014001-4':
-        X = np.load('./data/' + 'BNCI2014001' + '/X.npy')
-        y = np.load('./data/' + 'BNCI2014001' + '/labels.npy')
-    else:
-        X = np.load('./data/' + dataset + '/X.npy')
-        y = np.load('./data/' + dataset + '/labels.npy')
-    print(X.shape, y.shape)
-
-    num_subjects, paradigm, sample_rate = None, None, None
-
-    if dataset == 'BNCI2014001':
-        paradigm = 'MI'
-        num_subjects = 9
-        sample_rate = 250
-        ch_num = 22
-
-        # only use session T, remove session E
-        indices = []
-        for i in range(num_subjects):
-            indices.append(np.arange(288) + (576 * i))
-        indices = np.concatenate(indices, axis=0)
-        X = X[indices]
-        y = y[indices]
-
-        # only use two classes [left_hand, right_hand]
-        indices = []
-        for i in range(len(y)):
-            if y[i] in ['left_hand', 'right_hand']:
-                indices.append(i)
-        X = X[indices]
-        y = y[indices]
-    elif dataset == 'BNCI2014002':
-        paradigm = 'MI'
-        num_subjects = 14
-        sample_rate = 512
-        ch_num = 15
-
-        # only use session train, remove session test
-        indices = []
-        for i in range(num_subjects):
-            indices.append(np.arange(100) + (160 * i))
-        indices = np.concatenate(indices, axis=0)
-        X = X[indices]
-        y = y[indices]
-
-    elif dataset == 'BNCI2015001':
-        paradigm = 'MI'
-        num_subjects = 12
-        sample_rate = 512
-        ch_num = 13
-
-        # only use session 1, remove session 2/3
-        indices = []
-        for i in range(num_subjects):
-            if i in [7, 8, 9, 10]:
-                indices.append(np.arange(200) + (400 * 7) + 600 * (i - 7))
-            elif i == 11:
-                indices.append(np.arange(200) + (400 * 7) + 600 * (i - 7))
-            else:
-                indices.append(np.arange(200) + (400 * i))
-        indices = np.concatenate(indices, axis=0)
-
-        X = X[indices]
-        y = y[indices]
-    elif dataset == 'BNCI2014001-4':
-        paradigm = 'MI'
-        num_subjects = 9
-        sample_rate = 250
-        ch_num = 22
-
-        # only use session T, remove session E
-        indices = []
-        for i in range(num_subjects):
-            indices.append(np.arange(288) + (576 * i))
-        indices = np.concatenate(indices, axis=0)
-        X = X[indices]
-        y = y[indices]
-
-    le = preprocessing.LabelEncoder()
-    y = le.fit_transform(y)
-    print('data shape:', X.shape, ' labels shape:', y.shape)
-    return X, y, num_subjects, paradigm, sample_rate, ch_num
+    root_dir = dataset
+    print(f"[DATA_LOAD] Root directory: {root_dir}")
+    # list all subject subfolders
+    subjects = [d for d in os.listdir(root_dir)
+                if os.path.isdir(os.path.join(root_dir, d))]
+    print(f"[DATA_LOAD] Found {len(subjects)} subject(s): {subjects!r}")
+    X_list, y_list = [], []
+    subject_counts = []
+    for s in subjects:
+        print(f"[DATA_LOAD] Loading subject '{s}'...")
+        trials, labels = load_subject_data(os.path.join(root_dir, s), Fs=200)
+        print(f"[DATA_LOAD]  -> {len(trials)} trial(s), {len(labels)} label(s) loaded")
+        for tr in trials:
+            X_list.append(tr)           # tr: channels x samples
+        y_list.extend(labels.tolist()) # labels as array
+        subject_counts.append(len(trials))
+    X = np.stack(X_list, axis=0)      # shape: [n_trials, channels, samples]
+    print(f"[DATA_LOAD] Total assembled trials: {X.shape[0]}")
+    y = np.array(y_list)
+    num_subjects = len(subjects)
+    ch_num = X.shape[1]
+    sample_rate = 200
+    paradigm = 'MI'
+    print(f"[DATA_LOAD] Completed: {num_subjects} subject(s), {X.shape[0]} trials, "
+          f"{ch_num} channels @ {sample_rate}Hz")
+    # also return subject names
+    return X, y, num_subjects, paradigm, sample_rate, ch_num, subject_counts, subjects
 
 
 def data_alignment(X, num_subjects):
@@ -211,23 +163,23 @@ def ml_classifier(approach, output_probability, train_x, train_y, test_x, return
 
 
 def ml_cross(dataset, info, align, approach):
-    X, y, num_subjects, paradigm, sample_rate, ch_num = data_process(dataset)
+    X, y, num_subjects, paradigm, sample_rate, ch_num, subject_counts, subjects = data_process(dataset)
     print('X, y, num_subjects, paradigm, sample_rate:', X.shape, y.shape, num_subjects, paradigm, sample_rate)
-
-    print('sample rate:', sample_rate)
 
     if align:
         X = data_alignment(X, num_subjects)
+        y = y[: X.shape[0]]
 
     scores_arr = []
-
     for i in range(num_subjects):
-        train_x, train_y, test_x, test_y = traintest_split_cross_subject(dataset, X, y, num_subjects, i)
+        # verbose subject name
+        print(f"[ML_CROSS] Leave‐one‐out: training on all except '{subjects[i]}', testing on '{subjects[i]}'")
+        train_x, train_y, test_x, test_y = traintest_split_cross_subject(X, y, subject_counts, i)
         print('train_x, train_y, test_x, test_y.shape', train_x.shape, train_y.shape, test_x.shape, test_y.shape)
 
         if paradigm == 'MI':
             # CSP
-            csp = mne.decoding.CSP(n_components=10)
+            csp = mne.decoding.CSP(n_components=6)
             train_x_csp = csp.fit_transform(train_x, train_y)
             test_x_csp = csp.transform(test_x)
 
@@ -247,7 +199,7 @@ def ml_cross(dataset, info, align, approach):
 
 
 def ml_within(dataset, info, align, approach, cuda_device_id):
-    X, y, num_subjects, paradigm, sample_rate, ch_num = data_process(dataset)
+    X, y, num_subjects, paradigm, sample_rate, ch_num, subject_counts, subjects = data_process(dataset)
     print('X, y, num_subjects, paradigm, sample_rate:', X.shape, y.shape, num_subjects, paradigm, sample_rate)
 
     print('sample rate:', sample_rate)
@@ -281,26 +233,11 @@ def ml_within(dataset, info, align, approach, cuda_device_id):
     return scores_arr
 
 
+# toggle Euclidean Alignment on/off
+USE_EA = True
+
 if __name__ == '__main__':
-
-    scores = []
-
-    seed = 42
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    dataset_arr = ['BNCI2014001', 'BNCI2014002', 'BNCI2015001']
-
-    for dataset in dataset_arr:
-
-        for approach in ['LDA']:
-            # use EA
-            align = True
-
-            print(dataset, align, approach)
-
-            # info = dataset_to_file(dataset, data_save=False)
-
-            ml_cross(dataset, None, align, approach)
-            #ml_within(dataset, info, align, approach)
+    # Example invocation:
+    root_dir = r"E:\Exoskeleton_DL\XK_work\Data_Epoch"
+    print(f"ML cross‐subject run (Euclidean Alignment = {USE_EA})")
+    ml_cross(root_dir, None, align=USE_EA, approach='LDA')

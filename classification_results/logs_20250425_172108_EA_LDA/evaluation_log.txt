@@ -1,0 +1,61 @@
+Loading data from all subjects...
+Total trials aggregated: 10857
+
+Subjects details:
+Subject CH: Sessions = 12, Trials = 1320
+Subject CY: Sessions = 12, Trials = 1140
+Subject JXW: Sessions = 12, Trials = 1161
+Subject LAM: Sessions = 12, Trials = 1140
+Subject LM: Sessions = 12, Trials = 1080
+Subject SZW: Sessions = 12, Trials = 1080
+Subject XX: Sessions = 12, Trials = 1380
+Subject YJM: Sessions = 12, Trials = 1236
+Subject ZJH: Sessions = 12, Trials = 1320
+
+==== Skipping Inter-Subject k-Fold Cross Validation ====
+
+==== Running Leave-One-Subject-Out Evaluation ====
+
+LOSO - Testing on Subject CH (1320 trials)
+  Training on 8 subjects (9537 trials): CY, JXW, LAM, LM, SZW, XX, YJM, ZJH
+  Subject CH: LOSO Accuracy = 76.67%
+
+LOSO - Testing on Subject CY (1140 trials)
+  Training on 8 subjects (9717 trials): CH, JXW, LAM, LM, SZW, XX, YJM, ZJH
+  Subject CY: LOSO Accuracy = 80.88%
+
+LOSO - Testing on Subject JXW (1161 trials)
+  Training on 8 subjects (9696 trials): CH, CY, LAM, LM, SZW, XX, YJM, ZJH
+  Subject JXW: LOSO Accuracy = 60.03%
+
+LOSO - Testing on Subject LAM (1140 trials)
+  Training on 8 subjects (9717 trials): CH, CY, JXW, LM, SZW, XX, YJM, ZJH
+  Subject LAM: LOSO Accuracy = 63.51%
+
+LOSO - Testing on Subject LM (1080 trials)
+  Training on 8 subjects (9777 trials): CH, CY, JXW, LAM, SZW, XX, YJM, ZJH
+  Subject LM: LOSO Accuracy = 72.31%
+
+LOSO - Testing on Subject SZW (1080 trials)
+  Training on 8 subjects (9777 trials): CH, CY, JXW, LAM, LM, XX, YJM, ZJH
+  Subject SZW: LOSO Accuracy = 76.57%
+
+LOSO - Testing on Subject XX (1380 trials)
+  Training on 8 subjects (9477 trials): CH, CY, JXW, LAM, LM, SZW, YJM, ZJH
+  Subject XX: LOSO Accuracy = 60.36%
+
+LOSO - Testing on Subject YJM (1236 trials)
+  Training on 8 subjects (9621 trials): CH, CY, JXW, LAM, LM, SZW, XX, ZJH
+  Subject YJM: LOSO Accuracy = 56.88%
+
+LOSO - Testing on Subject ZJH (1320 trials)
+  Training on 8 subjects (9537 trials): CH, CY, JXW, LAM, LM, SZW, XX, YJM
+  Subject ZJH: LOSO Accuracy = 79.92%
+
+Overall LOSO Accuracy: 69.68%
+
+==== Skipping Intra-Subject Cross Validation ====
+
+==== Skipping Intra-Session Evaluation ====
+
+==== Skipping Incremental Subject LOSO Evaluation ====

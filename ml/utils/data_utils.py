@@ -24,14 +24,17 @@ def time_cut(data, cut_percentage):
     return data
 
 
-def traintest_split_cross_subject(dataset, X, y, num_subjects, test_subject_id):
-    data_subjects = np.split(X, indices_or_sections=num_subjects, axis=0)
-    labels_subjects = np.split(y, indices_or_sections=num_subjects, axis=0)
-    test_x = data_subjects.pop(test_subject_id)
-    test_y = labels_subjects.pop(test_subject_id)
+def traintest_split_cross_subject(X, y, subject_counts, test_subject_id):
+    """
+    Leave‐one‐subject‐out split using actual per‐subject trial counts.
+    """
+    offsets = np.cumsum(subject_counts)[:-1]
+    data_subjects = np.split(X, offsets, axis=0)
+    labels_subjects = np.split(y, offsets, axis=0)
+
+    subj_data = data_subjects.pop(test_subject_id)
+    subj_label = labels_subjects.pop(test_subject_id)
     train_x = np.concatenate(data_subjects, axis=0)
     train_y = np.concatenate(labels_subjects, axis=0)
-    print('Test subject s' + str(test_subject_id))
-    print('Training/Test split:', train_x.shape, test_x.shape)
-    return train_x, train_y, test_x, test_y
+    return train_x, train_y, subj_data, subj_label
 
