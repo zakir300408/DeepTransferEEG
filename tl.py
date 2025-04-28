@@ -150,7 +150,7 @@ def main():
     Fs = 200
     n_ch = 31
     n_csp = 6
-    win_size = 20
+    win_size = 40
     min_test = 5
     n_windows = 5
     options = {'sigma':0.01, 'lambda':1, 'wt':1.0, 'src_wt':1}
