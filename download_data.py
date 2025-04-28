@@ -1,10 +1,16 @@
 import os
+import time
 
 import numpy as np
 import moabb
 
 from moabb.datasets import BNCI2014001, BNCI2014002, BNCI2015001
 from moabb.paradigms import MotorImagery, P300
+
+
+# Add retry settings
+MAX_RETRIES = 3
+RETRY_DELAY = 5  # seconds
 
 
 def dataset_to_file(dataset_name, data_save):
@@ -24,7 +30,16 @@ def dataset_to_file(dataset_name, data_save):
 
     if data_save:
         print('preparing ' + str(dataset_name) + ' data...')
-        X, labels, meta = paradigm.get_data(dataset=dataset, subjects=dataset.subject_list[:])
+        # retry download/get_data on failure
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                X, labels, meta = paradigm.get_data(dataset=dataset, subjects=dataset.subject_list[:])
+                break
+            except Exception as e:
+                print(f"Attempt {attempt}/{MAX_RETRIES} failed: {e}")
+                if attempt == MAX_RETRIES:
+                    raise
+                time.sleep(RETRY_DELAY)
         ar_unique, cnts = np.unique(labels, return_counts=True)
         print("labels:", ar_unique)
         print("Counts:", cnts)
