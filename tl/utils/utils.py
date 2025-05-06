@@ -6,6 +6,7 @@ import os.path as osp
 import os
 import numpy as np
 import random
+import pandas as pd
 
 import torch as tr
 import torch.nn as nn
@@ -392,13 +393,38 @@ def cal_metrics_multisource(loader, nets, args, metrics):
 
 def data_alignment(X, num_subjects, args):
     '''
-    :param X: np array, EEG data
-    :param num_subjects: int, number of total subjects in X
-    :return: np array, aligned EEG data
+    :param X: np array, EEG data for either source (all except target) or target (only that subject)
+    :param num_subjects: int, expected number of chunks (args.N-1 for source, 1 for target)
     '''
-    # subject-wise EA
-    if args.data == 'BNCI2015003' and len(
-            X) < 141:  # check is dataset BNCI2015003 and is downsampled and is not testset
+    # CustomEpoch: handle unequal trials per subject
+    if args.data == 'CustomEpoch':
+        print(f"=== CustomEpoch EA start (idt={args.idt}, num_subjects={num_subjects}) input shape: {X.shape}")
+        meta = pd.read_csv('./data/CustomEpoch/meta.csv')
+        meta['subj'] = meta['file'].str.split('_').str[0]
+        grp = meta.groupby('subj')['n_trials'].sum().reset_index()
+        counts = grp['n_trials'].values  # full per-subject counts
+
+        if num_subjects > 1:
+            # source alignment: drop target count and slice X accordingly
+            counts_src = np.delete(counts, args.idt)
+            starts = np.concatenate(([0], np.cumsum(counts_src)[:-1]))
+            ends   = np.cumsum(counts_src)
+            out = []
+            for k in range(len(counts_src)):
+                seg = X[starts[k]:ends[k]]
+                print(f"  EA on source segment {k}: shape {seg.shape}")
+                out.append(EA(seg))
+            print(f"=== CustomEpoch EA source done, concatenated shape: {np.concatenate(out,axis=0).shape}")
+            return np.concatenate(out, axis=0)
+        else:
+            print(f"  EA on target entire data")
+            aligned = EA(X)
+            print(f"=== CustomEpoch EA target done, output shape: {aligned.shape}")
+            return aligned
+
+    # subject-wise EA for other datasets
+    if args.data == 'BNCI2015003' and len(X) < 141:
+        # check is dataset BNCI2015003 and is downsampled and is not testset
         # upsampling for unequal distributions across subjects, i.e., each subject is upsampled to different num of trials
         print('before EA:', X.shape)
         out = []
@@ -409,7 +435,8 @@ def data_alignment(X, num_subjects, args):
             out.append(tmp_x)
         X = np.concatenate(out, axis=0)
         print('after EA:', X.shape)
-    elif args.data == 'BNCI2015003' and len(X) > 25200:  # check is dataset BNCI2015003 and is upsampled
+    elif args.data == 'BNCI2015003' and len(X) > 25200:
+        # check is dataset BNCI2015003 and is upsampled
         # upsampling for unequal distributions across subjects, i.e., each subject is upsampled to different num of trials
         print('before EA:', X.shape)
         out = []

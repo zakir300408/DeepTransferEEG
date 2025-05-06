@@ -317,16 +317,23 @@ def train_target(args):
 
 if __name__ == '__main__':
 
-    data_name_list = ['BNCI2014001', 'BNCI2014002', 'BNCI2015001', 'BNCI2014001-4']
+    data_name_list = [ 'CustomEpoch']
 
     dct = pd.DataFrame(columns=['dataset', 'avg', 'std', 's0', 's1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9', 's10', 's11', 's12', 's13'])
 
     for data_name in data_name_list:
         # N: number of subjects, chn: number of channels
-        if data_name == 'BNCI2014001': paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 9, 22, 2, 1001, 250, 144, 248
-        if data_name == 'BNCI2014002': paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 14, 15, 2, 2561, 512, 100, 640
-        if data_name == 'BNCI2015001': paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 12, 13, 2, 2561, 512, 200, 640
-        if data_name == 'BNCI2014001-4': paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 9, 22, 4, 1001, 250, 288, 248
+        if data_name == 'BNCI2014001':
+            paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 9, 22, 2, 1001, 250, 144, 248
+        elif data_name == 'BNCI2014002':
+            paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 14, 15, 2, 2561, 512, 100, 640
+        elif data_name == 'BNCI2015001':
+            paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 12, 13, 2, 2561, 512, 200, 640
+        elif data_name == 'CustomEpoch':
+            # match your settings in dnn.py
+            paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 9, 31, 2, 1600, 200, 1000, 400
+        else:
+            raise ValueError(f"Unknown data_name {data_name}")
 
         # whether to use pretrained model
         # if source models have not been trained, set use_pretrained_model to False to train them
@@ -442,11 +449,14 @@ if __name__ == '__main__':
         args.log.record(str(total_mean))
         args.log.record(str(total_std))
 
+        # build result_dct for this dataset
         result_dct = {'dataset': data_name, 'avg': total_mean, 'std': total_std}
         for i in range(len(subject_mean)):
             result_dct['s' + str(i)] = subject_mean[i]
 
-        dct = dct.append(result_dct, ignore_index=True)
+        # replace deprecated append(...)
+        # dct = dct.append(result_dct, ignore_index=True)
+        dct = pd.concat([dct, pd.DataFrame([result_dct])], ignore_index=True)
 
     # save results to csv
     dct.to_csv('./logs/' + str(args.method) + ".csv")

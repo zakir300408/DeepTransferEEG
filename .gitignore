@@ -26,6 +26,8 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+*.csv
+*.txt
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -139,3 +141,8 @@ maml.py
 aug_utils.py
 test.py
 feature_ssda.py
+
+# Ignore checkpoint files
+*.ckpt
+/runs/
+*.npy

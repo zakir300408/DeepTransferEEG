@@ -25,7 +25,10 @@ def EA(x):
     for i in range(x.shape[0]):
         cov[i] = np.cov(x[i])
     refEA = np.mean(cov, 0)
-    sqrtRefEA = fractional_matrix_power(refEA, -0.5)
+    # add small ridge to diagonal for numerical stability
+    eps = 1e-6
+    refEA_reg = refEA + np.eye(refEA.shape[0]) * eps
+    sqrtRefEA = fractional_matrix_power(refEA_reg, -0.5)
     XEA = np.zeros(x.shape)
     for i in range(x.shape[0]):
         XEA[i] = np.dot(sqrtRefEA, x[i])

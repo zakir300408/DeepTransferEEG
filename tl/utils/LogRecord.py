@@ -5,6 +5,8 @@
 
 import torch as tr
 import os.path as osp
+import os
+import time
 from datetime import datetime
 from datetime import timedelta, timezone
 
@@ -24,18 +26,9 @@ class LogRecord:
         self.align = args.align
 
     def log_init(self):
-        create_folder(self.result_dir, self.args.data_env, self.args.local_dir)
-
-        if self.data_env in ['local', 'mac']:
-            time_str = datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(
-                timezone(timedelta(hours=8), name='Asia/Shanghai')).strftime("%Y-%m-%d_%H_%M_%S")
-        if self.data_env == 'gpu':
-            time_str = datetime.utcnow().replace(tzinfo=timezone.utc).strftime("%Y-%m-%d_%H_%M_%S")
-        if self.align:
-            align_str = '_'
-        else:
-            align_str = '_noalign_'
-        file_name_head = 'log_' + self.method + align_str + self.data_name + '_'
+        os.makedirs(self.args.result_dir, exist_ok=True)  # ensure logs folder exists
+        file_name_head = 'log_' + str(self.args.method) + '_' + str(self.args.data_name) + '_'
+        time_str = time.strftime("%Y-%m-%d_%H_%M_%S", time.localtime())
         self.args.out_file = open(osp.join(self.args.result_dir, file_name_head + time_str + '.txt'), 'w')
         self.args.out_file.write(self._print_args() + '\n')
         self.args.out_file.flush()

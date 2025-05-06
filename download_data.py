@@ -1,6 +1,8 @@
 import os
 import time
-
+import glob
+from scipy.io import loadmat
+import pandas as pd
 import numpy as np
 import moabb
 
@@ -27,30 +29,58 @@ def dataset_to_file(dataset_name, data_save):
         dataset = BNCI2015001()
         paradigm = MotorImagery(n_classes=2)
         # (5600, 13, 2561) (5600,) 512Hz 12subjects * 2 classes * (200 + 200 + (200 for Subj 8/9/10/11)) trials * (2/3)sessions
+    elif dataset_name == 'CustomEpoch':
+        root_dir = r"E:\Exoskeleton_DL\XK_work\Data_Epoch"
+        mat_files = sorted(glob.glob(os.path.join(root_dir, "*", "*.mat")))
+        if not mat_files:
+            raise ValueError(f"No .mat files found in CustomEpoch path {root_dir}")
+        all_X, all_y, meta_rows = [], [], []
+        for fn in mat_files:
+            mat = loadmat(fn)
+            X = mat['MyEpoch']                   # (n_trials, samples, channels)
+            X = X.transpose(0, 2, 1)             # to (n_trials, channels, samples)
+            y = mat['MyLabel'].flatten()
+            all_X.append(X)
+            all_y.append(y)
+            meta_rows.append({
+                'file': os.path.basename(fn),
+                'n_trials': X.shape[0]
+            })
+        X = np.concatenate(all_X, axis=0)
+        labels = np.concatenate(all_y, axis=0)
+        labels = labels.astype(int)
+        labels = labels - labels.min()        # ensure classes start at 0
+        meta = pd.DataFrame(meta_rows)
+    else:
+        raise ValueError(f"Unknown dataset {dataset_name}")
 
     if data_save:
-        print('preparing ' + str(dataset_name) + ' data...')
-        # retry download/get_data on failure
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                X, labels, meta = paradigm.get_data(dataset=dataset, subjects=dataset.subject_list[:])
-                break
-            except Exception as e:
-                print(f"Attempt {attempt}/{MAX_RETRIES} failed: {e}")
-                if attempt == MAX_RETRIES:
-                    raise
-                time.sleep(RETRY_DELAY)
+        print(f'preparing {dataset_name} data...')
+        if dataset_name.startswith('BNCI'):
+            # retry download/get_data on failure
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    X, labels, meta = paradigm.get_data(
+                        dataset=dataset,
+                        subjects=dataset.subject_list[:]
+                    )
+                    break
+                except Exception as e:
+                    print(f"Attempt {attempt}/{MAX_RETRIES} failed: {e}")
+                    if attempt == MAX_RETRIES:
+                        raise
+                    time.sleep(RETRY_DELAY)
+        # display counts for all datasets
         ar_unique, cnts = np.unique(labels, return_counts=True)
         print("labels:", ar_unique)
         print("Counts:", cnts)
         print(X.shape, labels.shape)
-        if not os.path.exists('./data/'):
-            os.makedirs('./data/')
-        if not os.path.exists('./data/' + dataset_name + '/'):
-            os.makedirs('./data/' + dataset_name + '/')
-        np.save('./data/' + dataset_name + '/X', X)
-        np.save('./data/' + dataset_name + '/labels', labels)
-        meta.to_csv('./data/' + dataset_name + '/meta.csv')
+        # save to disk
+        data_dir = os.path.join('.', 'data', dataset_name)
+        os.makedirs(data_dir, exist_ok=True)
+        np.save(os.path.join(data_dir, 'X'), X)
+        np.save(os.path.join(data_dir, 'labels'), labels)
+        meta.to_csv(os.path.join(data_dir, 'meta.csv'), index=False)
         print('done!')
     else:
         if isinstance(paradigm, MotorImagery):
@@ -63,9 +93,14 @@ def dataset_to_file(dataset_name, data_save):
 
 if __name__ == '__main__':
 
-    datasets = ['BNCI2014001', 'BNCI2014002', 'BNCI2015001']
-    for dataset_name in datasets:
-        info = dataset_to_file(dataset_name, data_save=True)
+    datasets = [
+        # 'BNCI2014001',
+        # 'BNCI2014002',
+        # 'BNCI2015001',
+        'CustomEpoch'                  # <-- add your folder here
+    ]
+    for ds in datasets:
+        dataset_to_file(ds, data_save=True)
 
     '''
     BNCI2014001
