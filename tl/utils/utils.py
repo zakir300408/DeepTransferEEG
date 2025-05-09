@@ -393,34 +393,57 @@ def cal_metrics_multisource(loader, nets, args, metrics):
 
 def data_alignment(X, num_subjects, args):
     '''
-    :param X: np array, EEG data for either source (all except target) or target (only that subject)
-    :param num_subjects: int, expected number of chunks (args.N-1 for source, 1 for target)
+    :param X: np array, EEG data for either source or target
+    :param num_subjects: number of sessions in this block (source or target)
     '''
-    # CustomEpoch: handle unequal trials per subject
+    # CustomEpoch: handle unequal trials per session
     if args.data == 'CustomEpoch':
         print(f"=== CustomEpoch EA start (idt={args.idt}, num_subjects={num_subjects}) input shape: {X.shape}")
-        meta = pd.read_csv('./data/CustomEpoch/meta.csv')
-        meta['subj'] = meta['file'].str.split('_').str[0]
-        grp = meta.groupby('subj')['n_trials'].sum().reset_index()
-        counts = grp['n_trials'].values  # full per-subject counts
-
-        if num_subjects > 1:
-            # source alignment: drop target count and slice X accordingly
-            counts_src = np.delete(counts, args.idt)
-            starts = np.concatenate(([0], np.cumsum(counts_src)[:-1]))
-            ends   = np.cumsum(counts_src)
+        meta   = pd.read_csv('./data/CustomEpoch/meta.csv')
+        counts = meta['n_trials'].values               # trials per session
+        # compute cumulative boundaries
+        starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+        ends   = np.cumsum(counts)
+        # list of target sessions
+        idts = args.idt if isinstance(args.idt, (list, tuple)) else [args.idt]
+        # decide which sessions to align
+        if num_subjects == args.N - len(idts):
+            # source: drop target sessions
+            counts_src = np.delete(counts, idts)
+            starts_src = np.concatenate(([0], np.cumsum(counts_src)[:-1]))
+            ends_src   = np.cumsum(counts_src)
             out = []
             for k in range(len(counts_src)):
-                seg = X[starts[k]:ends[k]]
+                seg = X[starts_src[k]:ends_src[k]]
                 print(f"  EA on source segment {k}: shape {seg.shape}")
                 out.append(EA(seg))
-            print(f"=== CustomEpoch EA source done, concatenated shape: {np.concatenate(out,axis=0).shape}")
-            return np.concatenate(out, axis=0)
-        else:
-            print(f"  EA on target entire data")
-            aligned = EA(X)
-            print(f"=== CustomEpoch EA target done, output shape: {aligned.shape}")
+            aligned = np.concatenate(out, axis=0)
+            print(f"=== CustomEpoch EA source done, concatenated shape: {aligned.shape}")
             return aligned
+        elif num_subjects == len(idts):
+            # target: align each selected session separately
+            # target: split X (which is already only the target sessions in args.idt order)
+            out = []
+            meta = pd.read_csv('./data/CustomEpoch/meta.csv')
+            counts = meta['n_trials'].values
+            # pick only this subject’s sessions
+            sel_counts = counts[idts]
+            # build local starts/ends
+            local_starts = np.concatenate(([0], np.cumsum(sel_counts)[:-1]))
+            local_ends   = np.cumsum(sel_counts)
+            for k, (s_loc, e_loc) in enumerate(zip(local_starts, local_ends)):
+                seg = X[s_loc:e_loc]
+                print(f"  EA on target segment local #{k}: shape {seg.shape}")
+                if seg.shape[0] > 0:
+                    out.append(EA(seg))
+            if not out:
+                print("  No non-empty target segments; skipping EA for target")
+                return X
+            aligned = np.concatenate(out, axis=0)
+            print(f"=== CustomEpoch EA target done, concatenated shape: {aligned.shape}")
+            return aligned
+        else:
+            raise ValueError("Invalid num_subjects for CustomEpoch EA")
 
     # subject-wise EA for other datasets
     if args.data == 'BNCI2015003' and len(X) < 141:
@@ -465,9 +488,12 @@ def data_loader(Xs=None, Ys=None, Xt=None, Yt=None, args=None):
 
     Xt_copy = Xt
     if args.align:
-        # offline EA
-        Xs = data_alignment(Xs, args.N - 1, args)
-        Xt = data_alignment(Xt, 1, args)
+        # offline EA per session
+        idt_list = args.idt if isinstance(args.idt, (list, tuple)) else [args.idt]
+        # source has total sessions minus len(idt_list)
+        Xs = data_alignment(Xs, args.N - len(idt_list), args)
+        # target has len(idt_list) sessions
+        Xt = data_alignment(Xt, len(idt_list), args)
 
     Xs, Ys = tr.from_numpy(Xs).to(
         tr.float32), tr.from_numpy(Ys.reshape(-1, )).to(tr.long)

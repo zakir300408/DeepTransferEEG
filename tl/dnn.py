@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import pandas as pd
+from torch.utils.data import DataLoader, TensorDataset
 
 from utils.network import backbone_net
 from utils.LogRecord import LogRecord
@@ -21,10 +22,30 @@ import sys
 
 def train_target(args):
     X_src, y_src, X_tar, y_tar = read_mi_combine_tar(args)
+    # prepare per‐session boundaries for CustomEpoch
+    if args.data == 'CustomEpoch':
+        df_meta = pd.read_csv('./data/CustomEpoch/meta.csv')
+        counts = df_meta['n_trials'].values
+        idts = args.idt if isinstance(args.idt, (list,tuple)) else [args.idt]
+        bounds = []
+        start = 0
+        for i in idts:
+            length = counts[i]
+            bounds.append((start, start + length))
+            start += length
+        args.tar_bounds = bounds
+
     print('X_src, y_src, X_tar, y_tar:', X_src.shape, y_src.shape, X_tar.shape, y_tar.shape)
     # dynamic trial count per subject (CustomEpoch subjects vary in trial number)
     args.trial_num = y_tar.shape[0]
     dset_loaders = data_loader(X_src, y_src, X_tar, y_tar, args)
+
+    # grab EA‐aligned target tensors for per‐session splits
+    Xt_tensor, Yt_tensor = dset_loaders["target"].dataset.tensors
+    if args.data_env != 'local':
+        Xt_tensor, Yt_tensor = Xt_tensor.cpu(), Yt_tensor.cpu()
+    args.Xt_aligned = Xt_tensor.numpy()
+    args.Yt_aligned = Yt_tensor.numpy()
 
     netF, netC = backbone_net(args, return_type='xy')
     if args.data_env != 'local':
@@ -68,12 +89,31 @@ def train_target(args):
             base_network.eval()
 
             acc_t_te, _ = cal_acc_comb(dset_loaders["Target"], base_network, args=args)
-            # comment out last line and uncomment the next line for IEA results instead of offline EA results
-            # acc_t_te, _ = cal_acc_comb(dset_loaders["Target-Online-Prealigned"], base_network, args=args)
+            args.log.record(f"Task: {args.task_str}, Iter:{int(iter_num//len(dset_loaders['source']))}/{args.max_epoch}; Acc = {acc_t_te:.2f}%")
+            print(f"Task: {args.task_str}, Iter:{int(iter_num//len(dset_loaders['source']))}/{args.max_epoch}; Acc = {acc_t_te:.2f}%")
 
-            log_str = 'Task: {}, Iter:{}/{}; Acc = {:.2f}%'.format(args.task_str, int(iter_num // len(dset_loaders["source"])), int(max_iter // len(dset_loaders["source"])), acc_t_te)
-            args.log.record(log_str)
-            print(log_str)
+            # per‐session breakdown
+            for idx, (s, e) in enumerate(getattr(args, 'tar_bounds', [])):
+                if e <= s:
+                    args.log.record(f"  Session {idx} skipped (no trials)")
+                    continue
+                X_seg = args.Xt_aligned[s:e]
+                y_seg = args.Yt_aligned[s:e]
+
+                # build loader
+                ts = torch.from_numpy(X_seg).float()
+                if 'EEGNet' in args.backbone:
+                    # already in N,C,H,W from EA
+                    ts = ts
+                ys = torch.from_numpy(y_seg).long()
+                if args.data_env != 'local':
+                    ts, ys = ts.cuda(), ys.cuda()
+                loader = DataLoader(TensorDataset(ts, ys),
+                                    batch_size=args.batch_size*3,
+                                    shuffle=False)
+                acc_sess, _ = cal_acc_comb(loader, base_network, args=args)
+                args.log.record(f"  Session {idx} Acc = {acc_sess:.2f}%")
+                print(f"  Session {idx} Acc = {acc_sess:.2f}%")
 
             base_network.train()
 
@@ -101,14 +141,18 @@ if __name__ == '__main__':
     # include your CustomEpoch
     data_name_list = ['CustomEpoch']
 
-    # For CustomEpoch, read real subject IDs from meta.csv
+    # For CustomEpoch, read each session filename as a “subject”
     subject_names = None
     if 'CustomEpoch' in data_name_list:
         df_meta = pd.read_csv('./data/CustomEpoch/meta.csv')
-        subject_names = df_meta['file'].str.split('_').str[0].unique().tolist()
+        # keep each .mat filename in order
+        subject_names = df_meta['file'].tolist()
+
+    # initialize results container
+    dct = pd.DataFrame()
 
     for data_name in data_name_list:
-        # If CustomEpoch, set N from subject_names
+        # If CustomEpoch, set N from per-session list
         if data_name == 'CustomEpoch':
             N = len(subject_names)
 
@@ -123,8 +167,8 @@ if __name__ == '__main__':
         elif data_name == 'CustomEpoch':
             # adjust these values to match your CustomEpoch dataset
             paradigm        = 'MI'
-            N               = 9                 # number of subjects in CustomEpoch
-            chn             = 31                # number of channels in your epochs
+            N               = len(subject_names)  # sessions count
+            chn             = 31
             class_num       = 2                 # your labels are 0/1
             time_sample_num = 1600              # number of time-samples per trial
             sample_rate     = 200               # (or your actual sampling rate)
@@ -142,7 +186,7 @@ if __name__ == '__main__':
         args.method = 'EEGNet'
         args.backbone = 'EEGNet'
 
-        # whether to use EA
+        # enable EA instead of pure source‐only training
         args.align = True
 
         # learning rate
@@ -152,20 +196,17 @@ if __name__ == '__main__':
         args.batch_size = 32
 
         # training epochs
-        args.max_epoch = 10
+        args.max_epoch = 20
 
-        # GPU device id
-        try:
-            device_id = str(sys.argv[1])
-            os.environ["CUDA_VISIBLE_DEVICES"] = device_id
-            args.data_env = 'gpu' if torch.cuda.device_count() != 0 else 'local'
-        except:
-            args.data_env = 'local'
+        # detect device
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        args.data_env = 'gpu' if device.type=='cuda' else 'local'
+        args.device = device
 
         total_acc = []
 
         # train multiple randomly initialized models
-        for s in [1, 2, 3, 4, 5, 6, 7, 8, 9]:
+        for s in [4, 5, 6, 7, 8, 9]:
             args.SEED = s
 
             fix_random_seed(args.SEED)
@@ -182,27 +223,24 @@ if __name__ == '__main__':
             my_log = LogRecord(args)
             my_log.log_init()
             my_log.record('=' * 50 + '\n' + os.path.basename(__file__) + '\n' + '=' * 50)
+            args.log = my_log
 
-            sub_acc_all = np.zeros(N)
-            for idt in range(N):
-                args.idt = idt
-                if data_name == 'CustomEpoch':
-                    # real names
-                    target_str = subject_names[idt]
-                    others = subject_names.copy()
-                    others.pop(idt)
-                    source_str = 'Except_' + '_'.join(others)
-                else:
-                    source_str = 'Except_S' + str(idt)
-                    target_str = 'S' + str(idt)
-
+            clean = [f.replace('.mat', '') for f in subject_names]
+            prefixes = sorted({name.split('_')[0] for name in clean})
+            sub_acc = []
+            for prefix in prefixes:
+                # all session‐indices with this prefix become the target
+                idts = [i for i, name in enumerate(clean) if name.split('_')[0] == prefix]
+                args.idt = idts
+                target_str = prefix
+                source_str = 'Except_' + '_'.join([p for p in prefixes if p != prefix])
                 args.task_str = source_str + '_2_' + target_str
-                info_str = '\n========================== Transfer to ' + target_str + ' =========================='
-                print(info_str)
-                my_log.record(info_str)
-                args.log = my_log
+                info_str = '\n===== Transfer to ' + target_str + ' ====='
+                print(info_str); my_log.record(info_str)
+                acc = train_target(args)
+                sub_acc.append(acc)
+            sub_acc_all = np.array(sub_acc)
 
-                sub_acc_all[idt] = train_target(args)
             print('Sub acc: ', np.round(sub_acc_all, 3))
             print('Avg acc: ', np.round(np.mean(sub_acc_all), 3))
             total_acc.append(sub_acc_all)
@@ -235,7 +273,8 @@ if __name__ == '__main__':
         for i in range(len(subject_mean)):
             result_dct['s' + str(i)] = subject_mean[i]
 
-        dct = dct.append(result_dct, ignore_index=True)
+        # use pd.concat instead of deprecated DataFrame.append
+        dct = pd.concat([dct, pd.DataFrame([result_dct])], ignore_index=True)
 
     # save results to csv
     dct.to_csv('./logs/' + str(args.method) + ".csv")

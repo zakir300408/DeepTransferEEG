@@ -22,6 +22,7 @@ from sklearn.metrics import roc_auc_score, accuracy_score
 import gc
 import sys
 import time
+from torch.utils.data import DataLoader, TensorDataset
 
 
 def TTIME(loader, model, args, balanced=True):
@@ -53,9 +54,8 @@ def TTIME(loader, model, args, balanced=True):
         #################### Phase 1: target label prediction ####################
         model.eval()
         data = next(iter_test)
-        inputs = data[0]
-        labels = data[1]
-        inputs = inputs.reshape(1, 1, inputs.shape[-2], inputs.shape[-1]).cpu()
+        inputs, labels = data[0], data[1]
+        inputs = inputs.reshape(1, 1, inputs.shape[-2], inputs.shape[-1]).to(args.device)
 
         # accumulate test data
         if i == 0:
@@ -86,10 +86,7 @@ def TTIME(loader, model, args, balanced=True):
             sample_test = data_cum[i].numpy()
             sample_test = sample_test.reshape(1, 1, sample_test.shape[1], sample_test.shape[2])
 
-        if args.data_env != 'local':
-            sample_test = torch.from_numpy(sample_test).to(torch.float32).cuda()
-        else:
-            sample_test = torch.from_numpy(sample_test).to(torch.float32)
+        sample_test = torch.from_numpy(sample_test).to(torch.float32).to(args.device)
 
         _, outputs = model(sample_test)
 
@@ -115,10 +112,7 @@ def TTIME(loader, model, args, balanced=True):
                 batch_test = data_cum[i - args.test_batch + 1:i + 1].numpy()
                 batch_test = batch_test.reshape(args.test_batch, 1, batch_test.shape[2], batch_test.shape[3])
 
-            if args.data_env != 'local':
-                batch_test = torch.from_numpy(batch_test).to(torch.float32).cuda()
-            else:
-                batch_test = torch.from_numpy(batch_test).to(torch.float32)
+            batch_test = torch.from_numpy(batch_test).to(torch.float32).to(args.device)
 
             start_time = time.time()
             for step in range(args.steps):
@@ -203,14 +197,29 @@ def train_target(args):
         extra_string = '_noEA'
     else:
         extra_string = ''
+    # make sure save directory exists
+    os.makedirs(os.path.join('.', 'runs', args.data_name), exist_ok=True)
+
+    # load source/target
     X_src, y_src, X_tar, y_tar = read_mi_combine_tar(args)
-    print('X_src, y_src, X_tar, y_tar:', X_src.shape, y_src.shape, X_tar.shape, y_tar.shape)
+
+    # build per-session bounds for CustomEpoch
+    if args.data == 'CustomEpoch':
+        df_meta     = pd.read_csv('./data/CustomEpoch/meta.csv')
+        counts      = df_meta['n_trials'].values
+        idts        = args.idt if isinstance(args.idt, (list, tuple)) else [args.idt]
+        # compute local bounds relative to X_tar (only this subject’s sessions)
+        sel_counts    = counts[idts]
+        local_starts  = np.concatenate(([0], np.cumsum(sel_counts)[:-1]))
+        local_ends    = np.cumsum(sel_counts)
+        args.tar_bounds = [(local_starts[k], local_ends[k]) for k in range(len(idts))]
+
     dset_loaders = data_loader(X_src, y_src, X_tar, y_tar, args)
 
+    # move backbone and classifier to configured device
     netF, netC = backbone_net(args, return_type='xy')
-    if args.data_env != 'local':
-        netF, netC = netF.cuda(), netC.cuda()
-    base_network = nn.Sequential(netF, netC)
+    netF, netC = netF.to(args.device), netC.to(args.device)
+    base_network = nn.Sequential(netF, netC).to(args.device)
 
     if args.max_epoch == 0:
         if args.align:
@@ -237,6 +246,8 @@ def train_target(args):
             except:
                 iter_source = iter(dset_loaders["source"])
                 inputs_source, labels_source = next(iter_source)
+            # send source batch to device
+            inputs_source, labels_source = inputs_source.to(args.device), labels_source.to(args.device)
 
             if inputs_source.size(0) == 1:
                 continue
@@ -275,51 +286,107 @@ def train_target(args):
 
     base_network.eval()
 
+    # global pre-TTA IEA
     score = cal_score_online(dset_loaders["Target-Online"], base_network, args=args)
-    if args.balanced:
-        log_str = 'Task: {}, Online IEA Acc = {:.2f}%'.format(args.task_str, score)
+    pre_score = score
+    # per-session Pre-TTA IEA AUC
+    pre_scores = []
+    if args.data == 'CustomEpoch':
+        for idx,(s,e) in enumerate(getattr(args,'tar_bounds',[])):
+            if e<=s: continue
+            ts = torch.from_numpy(X_tar[s:e]).float()
+            if 'EEGNet' in args.backbone:
+                ts = ts.unsqueeze(3).permute(0,3,1,2)
+            ys = torch.from_numpy(y_tar[s:e]).long()
+            if args.data_env!='local':
+                ts,ys = ts.cuda(), ys.cuda()
+            loader = DataLoader(TensorDataset(ts,ys), batch_size=1, shuffle=False)
+            score_s = cal_score_online(loader, base_network, args=args)
+            args.log.record(f"  Pre-TTA IEA Session {idx} AUC = {score_s:.2f}%")
+            print(f"  Pre-TTA IEA Session {idx} AUC = {score_s:.2f}%")
+            pre_scores.append(score_s)
+        pre_score = float(np.mean(pre_scores)) if pre_scores else 0.0
     else:
-        log_str = 'Task: {}, Online IEA AUC = {:.2f}%'.format(args.task_str, score)
+        pre_score = cal_score_online(dset_loaders["Target-Online"], base_network, args=args)
+
+    if args.balanced:
+        log_str = 'Task: {}, Pre-TTA IEA Acc = {:.2f}%'.format(args.task_str, pre_score)
+    else:
+        log_str = 'Task: {}, Pre-TTA IEA AUC = {:.2f}%'.format(args.task_str, pre_score)
     args.log.record(log_str)
     print(log_str)
 
-    print('executing TTA...')
-
-    if args.balanced:
-        acc_t_te, y_pred = TTIME(dset_loaders["Target-Online"], base_network, args=args, balanced=True)
-        log_str = 'Task: {}, TTA Acc = {:.2f}%'.format(args.task_str, acc_t_te)
-    else:
-        acc_t_te, y_pred = TTIME(dset_loaders["Target-Online-Imbalanced"], base_network, args=args, balanced=False)
-        log_str = 'Task: {}, TTA AUC = {:.2f}%'.format(args.task_str, acc_t_te)
+    print('executing TTA per session...')
+    sess_accs = []
+    sess_test_accs = []
+    for idx, (s, e) in enumerate(getattr(args, 'tar_bounds', [])):
+        if e <= s:
+            args.log.record(f"  Session {idx} skipped for TTA (no trials)")
+            continue
+        # build per-session tensors
+        ts = torch.from_numpy(X_tar[s:e]).float()
+        ys = torch.from_numpy(y_tar[s:e]).long()
+        # restrict to first 20 trials only
+        max_tta = 20
+        ts_tta = ts[:max_tta]
+        ys_tta = ys[:max_tta]
+        ts_rem = ts[max_tta:]
+        ys_rem = ys[max_tta:]
+        if 'EEGNet' in args.backbone:
+            ts_tta = ts_tta.unsqueeze(3).permute(0, 3, 1, 2)
+            ts_rem = ts_rem.unsqueeze(3).permute(0, 3, 1, 2)
+        if args.data_env != 'local':
+            ts_tta, ys_tta = ts_tta.cuda(), ys_tta.cuda()
+            ts_rem, ys_rem = ts_rem.cuda(), ys_rem.cuda()
+        loader = DataLoader(TensorDataset(ts_tta, ys_tta), batch_size=1, shuffle=False)
+        # run TTA on this (trimmed) session
+        acc_sess, _ = TTIME(loader, base_network, args=args, balanced=args.balanced)
+        args.log.record(f"  Session {idx} TTA {'Acc' if args.balanced else 'AUC'} = {acc_sess:.2f}%")
+        print(f"  Session {idx} TTA {'Acc' if args.balanced else 'AUC'} = {acc_sess:.2f}%")
+        sess_accs.append(acc_sess)
+        # test on remaining trials
+        if len(ts_rem) > 0:
+            loader_rem = DataLoader(TensorDataset(ts_rem, ys_rem), batch_size=1, shuffle=False)
+            if args.balanced:
+                acc_rem, _ = cal_acc_comb(loader_rem, base_network, args=args)
+            else:
+                acc_rem = cal_score_online(loader_rem, base_network, args=args)
+            args.log.record(f"  Session {idx} post-TTA test {'Acc' if args.balanced else 'AUC'} = {acc_rem:.2f}%")
+            print(f"  Session {idx} post-TTA test {'Acc' if args.balanced else 'AUC'} = {acc_rem:.2f}%")
+            sess_test_accs.append(acc_rem)
+    # overall average across sessions
+    acc_t_te = float(np.mean(sess_accs)) if sess_accs else 0.0
+    acc_test = float(np.mean(sess_test_accs)) if sess_test_accs else 0.0
+    log_str = f"Task: {args.task_str}, Overall TTA {'Acc' if args.balanced else 'AUC'} = {acc_t_te:.2f}%"
     args.log.record(log_str)
     print(log_str)
-
-    if args.balanced:
-        print('Test Acc = {:.2f}%'.format(acc_t_te))
-
-    else:
-        print('Test AUC = {:.2f}%'.format(acc_t_te))
+    args.log.record(f"Task: {args.task_str}, Overall post-TTA test {'Acc' if args.balanced else 'AUC'} = {acc_test:.2f}%")
+    print(f"Overall post-TTA test {'Acc' if args.balanced else 'AUC'} = {acc_test:.2f}%")
 
     torch.save(base_network.state_dict(), './runs/' + str(args.data_name) + '/' + str(args.backbone) + '_S' + str(args.idt) + '_seed' + str(
         args.SEED) + extra_string + '_adapted' + '.ckpt')
-
-    # save the predictions for ensemble
-    with open('./logs/' + str(args.data_name) + '_' + str(args.method) + '_seed_' + str(args.SEED) +"_pred.csv", 'a') as f:
-        writer = csv.writer(f)
-        writer.writerow(y_pred)
 
     gc.collect()
     if args.data_env != 'local':
         torch.cuda.empty_cache()
 
-    return acc_t_te
+    return acc_t_te, pre_score, acc_test
 
 
 if __name__ == '__main__':
 
-    data_name_list = [ 'CustomEpoch']
+    data_name_list = ['CustomEpoch']
 
-    dct = pd.DataFrame(columns=['dataset', 'avg', 'std', 's0', 's1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9', 's10', 's11', 's12', 's13'])
+    # load session filenames and extract prefixes as in dnn.py
+    df_meta = pd.read_csv('./data/CustomEpoch/meta.csv')
+    # files list from df_meta (‘file’ column, full filenames)
+    files = df_meta['file'].tolist()
+    prefixes = sorted({f.split('_')[0] for f in files})
+    subject_names = prefixes
+
+    # prepare result columns for each prefix
+    sess_cols = [f's{i}' for i in range(len(subject_names))]
+    dct = pd.DataFrame(columns=['dataset','avg','std'] + sess_cols)
 
     for data_name in data_name_list:
         # N: number of subjects, chn: number of channels
@@ -330,8 +397,9 @@ if __name__ == '__main__':
         elif data_name == 'BNCI2015001':
             paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 12, 13, 2, 2561, 512, 200, 640
         elif data_name == 'CustomEpoch':
-            # match your settings in dnn.py
-            paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 9, 31, 2, 1600, 200, 1000, 400
+            paradigm = 'MI'
+            N = len(subject_names)  # number of unique prefixes/sessions
+            chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 31, 2, 1600, 200, 1000, 400
         else:
             raise ValueError(f"Unknown data_name {data_name}")
 
@@ -344,16 +412,16 @@ if __name__ == '__main__':
             max_epoch = 0
         else:
             # training epochs
-            max_epoch = 100
+            max_epoch = 20
 
         # learning rate
         lr = 0.001
 
         # test batch size
-        test_batch = 8
+        test_batch = 20
 
         # update step
-        steps = 1
+        steps = 10
 
         # update stride
         stride = 1
@@ -365,7 +433,7 @@ if __name__ == '__main__':
         t = 2
 
         # whether to test balanced or imbalanced (2:1) target subject
-        balanced = True
+        balanced = False
 
         # whether to record running time
         calc_time = False
@@ -382,16 +450,14 @@ if __name__ == '__main__':
         args.batch_size = 32
 
         # GPU device id
-        try:
-            device_id = str(sys.argv[1])
-            os.environ["CUDA_VISIBLE_DEVICES"] = device_id
-            args.data_env = 'gpu' if torch.cuda.device_count() != 0 else 'local'
-        except:
-            args.data_env = 'local'
+        # detect device and default to GPU if available
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        args.device = device
+        args.data_env = 'gpu' if torch.cuda.is_available() else 'local'
         total_acc = []
 
         # update multiple models, independently, from the source models
-        for s in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]:
+        for s in [1, 42]:
             args.SEED = s
 
             fix_random_seed(args.SEED)
@@ -408,21 +474,42 @@ if __name__ == '__main__':
             my_log = LogRecord(args)
             my_log.log_init()
             my_log.record('=' * 50 + '\n' + os.path.basename(__file__) + '\n' + '=' * 50)
+            args.log = my_log
+
+            # log device usage
+            print(f"Using device: {args.device}")
+            args.log.record(f"Using device: {args.device}")
 
             sub_acc_all = np.zeros(N)
+            pre_acc_all = np.zeros(N)
+            post_acc_all = np.zeros(N)
+
             for idt in range(N):
-                args.idt = idt
-                source_str = 'Except_S' + str(idt)
-                target_str = 'S' + str(idt)
+                # collect all session indices belonging to this subject prefix
+                target_str = subject_names[idt]
+                idts = [i for i, fn in enumerate(files) if fn.split('_')[0] == target_str]
+                args.idt = idts
+                # use prefix names
+                others = subject_names.copy()
+                others.pop(idt)
+                source_str = 'Except_' + '_'.join(others)
                 args.task_str = source_str + '_2_' + target_str
                 info_str = '\n========================== Transfer to ' + target_str + ' =========================='
                 print(info_str)
                 my_log.record(info_str)
-                args.log = my_log
 
-                sub_acc_all[idt] = train_target(args)
+                tta_acc, pre_acc, post_acc = train_target(args)
+                sub_acc_all[idt] = tta_acc
+                pre_acc_all[idt] = pre_acc
+                post_acc_all[idt] = post_acc
+
             print('Sub acc: ', np.round(sub_acc_all, 3))
             print('Avg acc: ', np.round(np.mean(sub_acc_all), 3))
+            print('Sub pre-TTA IEA Acc: ', np.round(pre_acc_all, 3))
+            print('Avg pre-TTA IEA Acc: ', np.round(np.mean(pre_acc_all), 3))
+            print('Sub post-TTA test AUC: ', np.round(post_acc_all, 3))
+            print('Avg post-TTA test AUC: ', np.round(np.mean(post_acc_all), 3))
+
             total_acc.append(sub_acc_all)
 
             acc_sub_str = str(np.round(sub_acc_all, 3).tolist())
@@ -451,12 +538,9 @@ if __name__ == '__main__':
 
         # build result_dct for this dataset
         result_dct = {'dataset': data_name, 'avg': total_mean, 'std': total_std}
-        for i in range(len(subject_mean)):
-            result_dct['s' + str(i)] = subject_mean[i]
+        for i, v in enumerate(subject_mean):
+            result_dct[f's{i}'] = v
 
-        # replace deprecated append(...)
-        # dct = dct.append(result_dct, ignore_index=True)
         dct = pd.concat([dct, pd.DataFrame([result_dct])], ignore_index=True)
 
-    # save results to csv
     dct.to_csv('./logs/' + str(args.method) + ".csv")
