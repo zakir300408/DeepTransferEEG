@@ -169,11 +169,12 @@ if __name__ == '__main__':
             paradigm        = 'MI'
             N               = len(subject_names)  # sessions count
             chn             = 31
-            class_num       = 2                 # your labels are 0/1
+            class_num       = 2                 
             time_sample_num = 1600              # number of time-samples per trial
-            sample_rate     = 200               # (or your actual sampling rate)
-            trial_num       = 1000              # not used for FC size
-            feature_deep_dim= 400               # F2*(time_sample_num/(4*8)) = 8*(1600/32)
+            sample_rate     = 200               
+            feature_deep_dim= 512               # F2*(time_sample_num/(4*8)) = 8*(1600/32)
+            import pandas as _pd
+            trial_num = int(_pd.read_csv('./data/CustomEpoch/meta.csv')['n_trials'].sum())
         else:
             raise ValueError(f"Unknown data_name {data_name}")
 

@@ -189,7 +189,11 @@ def TTIME(loader, model, args, balanced=True):
         y_pred = np.array(predict).reshape(-1, args.class_num)[:, 1]  # binary
         score = roc_auc_score(y_true, y_pred)
 
-    return score * 100, y_pred
+    # after loop ends, ensure sqrtRefEA exists when align=True
+    if args.align:
+        return score * 100, y_pred, sqrtRefEA
+    else:
+        return score * 100, y_pred, None
 
 
 def train_target(args):
@@ -208,11 +212,14 @@ def train_target(args):
         df_meta     = pd.read_csv('./data/CustomEpoch/meta.csv')
         counts      = df_meta['n_trials'].values
         idts        = args.idt if isinstance(args.idt, (list, tuple)) else [args.idt]
-        # compute local bounds relative to X_tar (only this subject’s sessions)
+        # compute local bounds relative to X_tar
         sel_counts    = counts[idts]
         local_starts  = np.concatenate(([0], np.cumsum(sel_counts)[:-1]))
         local_ends    = np.cumsum(sel_counts)
         args.tar_bounds = [(local_starts[k], local_ends[k]) for k in range(len(idts))]
+        # map each bound to its actual session filename
+        file_list = df_meta['file'].tolist()
+        args.session_names = [file_list[i] for i in idts]
 
     dset_loaders = data_loader(X_src, y_src, X_tar, y_tar, args)
 
@@ -240,6 +247,7 @@ def train_target(args):
         iter_num = 0
         base_network.train()
 
+        best_acc = 0.0  # track best validation Acc/AUC
         while iter_num < max_iter:
             try:
                 inputs_source, labels_source = next(iter_source)
@@ -266,25 +274,21 @@ def train_target(args):
 
             if iter_num % interval_iter == 0 or iter_num == max_iter:
                 base_network.eval()
-
                 if args.balanced:
                     acc_t_te, _ = cal_acc_comb(dset_loaders["Target"], base_network, args=args)
                     log_str = 'Task: {}, Iter:{}/{}; Offline-EA Acc = {:.2f}%'.format(args.task_str, int(iter_num // len(dset_loaders["source"])), int(max_iter // len(dset_loaders["source"])), acc_t_te)
                 else:
                     acc_t_te, _ = cal_auc_comb(dset_loaders["Target-Imbalanced"], base_network, args=args)
                     log_str = 'Task: {}, Iter:{}/{}; Offline-EA AUC = {:.2f}%'.format(args.task_str, int(iter_num // len(dset_loaders["source"])), int(max_iter // len(dset_loaders["source"])), acc_t_te)
-                args.log.record(log_str)
-                print(log_str)
+                args.log.record(log_str); print(log_str)
 
                 base_network.train()
 
-        print('saving model...')
+        # after all epochs, save model from last epoch
         torch.save(base_network.state_dict(),
-                   './runs/' + str(args.data_name) + '/' + str(args.backbone) + '_S' + str(
-                       args.idt) + '_seed' + str(args.SEED) + extra_string + '.ckpt')
+                   f'./runs/{args.data_name}/{args.backbone}_S{args.idt}_seed{args.SEED}{extra_string}_last.ckpt')
 
-
-    base_network.eval()
+        base_network.eval()
 
     # global pre-TTA IEA
     score = cal_score_online(dset_loaders["Target-Online"], base_network, args=args)
@@ -292,8 +296,8 @@ def train_target(args):
     # per-session Pre-TTA IEA AUC
     pre_scores = []
     if args.data == 'CustomEpoch':
-        for idx,(s,e) in enumerate(getattr(args,'tar_bounds',[])):
-            if e<=s: continue
+        for idx, (s, e) in enumerate(getattr(args, 'tar_bounds', [])):
+            if e <= s: continue
             ts = torch.from_numpy(X_tar[s:e]).float()
             if 'EEGNet' in args.backbone:
                 ts = ts.unsqueeze(3).permute(0,3,1,2)
@@ -302,8 +306,10 @@ def train_target(args):
                 ts,ys = ts.cuda(), ys.cuda()
             loader = DataLoader(TensorDataset(ts,ys), batch_size=1, shuffle=False)
             score_s = cal_score_online(loader, base_network, args=args)
-            args.log.record(f"  Pre-TTA IEA Session {idx} AUC = {score_s:.2f}%")
-            print(f"  Pre-TTA IEA Session {idx} AUC = {score_s:.2f}%")
+            sess_name = args.session_names[idx]
+            metric = 'Acc' if args.balanced else 'AUC'
+            args.log.record(f"  Pre-TTA IEA Session {sess_name} {metric} = {score_s:.2f}%")
+            print(f"  Pre-TTA IEA Session {sess_name} {metric} = {score_s:.2f}%")
             pre_scores.append(score_s)
         pre_score = float(np.mean(pre_scores)) if pre_scores else 0.0
     else:
@@ -320,40 +326,64 @@ def train_target(args):
     sess_accs = []
     sess_test_accs = []
     for idx, (s, e) in enumerate(getattr(args, 'tar_bounds', [])):
+        sess_name = args.session_names[idx]
         if e <= s:
-            args.log.record(f"  Session {idx} skipped for TTA (no trials)")
+            args.log.record(f"  Session {sess_name} skipped for TTA (no trials)")
             continue
         # build per-session tensors
         ts = torch.from_numpy(X_tar[s:e]).float()
         ys = torch.from_numpy(y_tar[s:e]).long()
-        # restrict to first 20 trials only
+
+        # repeat TTA up to 3 times on distinct batches of size max_tta
         max_tta = 20
-        ts_tta = ts[:max_tta]
-        ys_tta = ys[:max_tta]
-        ts_rem = ts[max_tta:]
-        ys_rem = ys[max_tta:]
-        if 'EEGNet' in args.backbone:
-            ts_tta = ts_tta.unsqueeze(3).permute(0, 3, 1, 2)
-            ts_rem = ts_rem.unsqueeze(3).permute(0, 3, 1, 2)
-        if args.data_env != 'local':
-            ts_tta, ys_tta = ts_tta.cuda(), ys_tta.cuda()
-            ts_rem, ys_rem = ts_rem.cuda(), ys_rem.cuda()
-        loader = DataLoader(TensorDataset(ts_tta, ys_tta), batch_size=1, shuffle=False)
-        # run TTA on this (trimmed) session
-        acc_sess, _ = TTIME(loader, base_network, args=args, balanced=args.balanced)
-        args.log.record(f"  Session {idx} TTA {'Acc' if args.balanced else 'AUC'} = {acc_sess:.2f}%")
-        print(f"  Session {idx} TTA {'Acc' if args.balanced else 'AUC'} = {acc_sess:.2f}%")
-        sess_accs.append(acc_sess)
-        # test on remaining trials
-        if len(ts_rem) > 0:
+        num_rounds = min(3, len(ts) // max_tta)
+
+        # temp lists for this session
+        round_accs = []
+        round_test_accs = []
+        for r in range(num_rounds):
+            start = r * max_tta
+            end   = start + max_tta
+            ts_tta = ts[start:end]
+            ys_tta = ys[start:end]
+            # the “remaining” are everything before+after this chunk
+            ts_rem = torch.cat([ts[:start], ts[end:]], dim=0)
+            ys_rem = torch.cat([ys[:start], ys[end:]], dim=0)
+            if 'EEGNet' in args.backbone:
+                ts_tta = ts_tta.unsqueeze(3).permute(0, 3, 1, 2)
+                ts_rem = ts_rem.unsqueeze(3).permute(0, 3, 1, 2)
+            if args.data_env != 'local':
+                ts_tta, ys_tta = ts_tta.cuda(), ys_tta.cuda()
+                ts_rem, ys_rem = ts_rem.cuda(), ys_rem.cuda()
+
+            # run TTA on this chunk
+            loader_tta = DataLoader(TensorDataset(ts_tta, ys_tta), batch_size=1, shuffle=False)
+            acc_tta, _, sqrtRefEA = TTIME(loader_tta, base_network, args=args, balanced=args.balanced)
+            args.log.record(f"  Round {r+1} TTA Acc = {acc_tta:.2f}%")
+            print(f"  Round {r+1} TTA Acc = {acc_tta:.2f}%")
+
+            # test on the remaining trials
+            if args.align and len(ts_rem) > 0:
+                # align the remaining trials with latest EA matrix
+                rem_np = ts_rem.squeeze(1).cpu().numpy()   # (n_rem, chn, time)
+                rem_aligned = np.einsum('ij,njt->nit', sqrtRefEA, rem_np)
+                ts_rem = torch.from_numpy(rem_aligned).unsqueeze(1).to(ts_rem.dtype)
+                if args.data_env != 'local':
+                    ts_rem = ts_rem.cuda()
             loader_rem = DataLoader(TensorDataset(ts_rem, ys_rem), batch_size=1, shuffle=False)
+
             if args.balanced:
                 acc_rem, _ = cal_acc_comb(loader_rem, base_network, args=args)
             else:
                 acc_rem = cal_score_online(loader_rem, base_network, args=args)
-            args.log.record(f"  Session {idx} post-TTA test {'Acc' if args.balanced else 'AUC'} = {acc_rem:.2f}%")
-            print(f"  Session {idx} post-TTA test {'Acc' if args.balanced else 'AUC'} = {acc_rem:.2f}%")
-            sess_test_accs.append(acc_rem)
+            args.log.record(f"  Round {r+1} post-TTA test Acc = {acc_rem:.2f}%")
+            print(f"  Round {r+1} post-TTA test Acc = {acc_rem:.2f}%")
+            round_accs.append(acc_tta)
+            round_test_accs.append(acc_rem)
+        # average over rounds for this session
+        if round_accs:
+            sess_accs.append(float(np.mean(round_accs)))
+            sess_test_accs.append(float(np.mean(round_test_accs)))
     # overall average across sessions
     acc_t_te = float(np.mean(sess_accs)) if sess_accs else 0.0
     acc_test = float(np.mean(sess_test_accs)) if sess_test_accs else 0.0
@@ -399,20 +429,25 @@ if __name__ == '__main__':
         elif data_name == 'CustomEpoch':
             paradigm = 'MI'
             N = len(subject_names)  # number of unique prefixes/sessions
-            chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 31, 2, 1600, 200, 1000, 400
+            chn, class_num, time_sample_num, sample_rate = 31, 2, 1600, 200
+            # EEGNet output feature dim = F2 * (Samples // (4*8)) = 16 * (1600//32) = 800
+            feature_deep_dim = 400
+            # use actual total trials across all sessions
+            import pandas as _pd
+            trial_num = int(_pd.read_csv('./data/CustomEpoch/meta.csv')['n_trials'].sum())
         else:
             raise ValueError(f"Unknown data_name {data_name}")
 
         # whether to use pretrained model
         # if source models have not been trained, set use_pretrained_model to False to train them
         # alternatively, run dnn.py to train source models, in seperating the steps
-        use_pretrained_model = True
+        use_pretrained_model = False
         if use_pretrained_model:
             # no training
             max_epoch = 0
         else:
             # training epochs
-            max_epoch = 20
+            max_epoch = 30
 
         # learning rate
         lr = 0.001
@@ -421,10 +456,10 @@ if __name__ == '__main__':
         test_batch = 20
 
         # update step
-        steps = 10
+        steps = 20
 
         # update stride
-        stride = 1
+        stride = 2
 
         # whether to use EA
         align = True
@@ -433,7 +468,7 @@ if __name__ == '__main__':
         t = 2
 
         # whether to test balanced or imbalanced (2:1) target subject
-        balanced = False
+        balanced = True
 
         # whether to record running time
         calc_time = False
@@ -457,7 +492,7 @@ if __name__ == '__main__':
         total_acc = []
 
         # update multiple models, independently, from the source models
-        for s in [1, 42]:
+        for s in [1, 5]:
             args.SEED = s
 
             fix_random_seed(args.SEED)

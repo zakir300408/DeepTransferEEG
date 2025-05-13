@@ -5,7 +5,7 @@
 import numpy as np
 import pandas as pd
 from sklearn import preprocessing
-from scipy.signal import butter, filtfilt
+from scipy.signal import butter, filtfilt, iirnotch
 from utils.data_utils import traintest_split_cross_subject, traintest_split_domain_classifier, traintest_split_multisource, traintest_split_domain_classifier_pretest, traintest_split_multisource
 
 
@@ -39,12 +39,22 @@ def data_process(dataset):
         paradigm     = 'MI'
         sample_rate  = 200
         ch_num       = X.shape[1]
-        # apply 8–32 Hz bandpass
+
+        # apply 50 Hz notch
         nyq = sample_rate / 2
-        b, a = butter(5, [8/nyq, 32/nyq], btype='band')
+        f0, Q = 50.0, 30.0
+        bn, an = iirnotch(f0/nyq, Q)
+        for i in range(X.shape[0]):
+            for j in range(X.shape[1]):
+                X[i, j, :] = filtfilt(bn, an, X[i, j, :])
+
+        # apply 8–32 Hz bandpass
+        
+        b, a = butter(5, [4/nyq, 30/nyq], btype='band')
         for i in range(X.shape[0]):
             for j in range(X.shape[1]):
                 X[i, j, :] = filtfilt(b, a, X[i, j, :])
+        
         y = preprocessing.LabelEncoder().fit_transform(y)
         # normalize each channel of each trial over time
         X = (X - X.mean(axis=2, keepdims=True)) / (X.std(axis=2, keepdims=True) + 1e-8)
@@ -164,6 +174,12 @@ def data_process_secondsession(dataset):
         for i in range(X.shape[0]):
             for j in range(X.shape[1]):
                 X[i, j, :] = filtfilt(b, a, X[i, j, :])
+        # apply 50 Hz notch
+        f0, Q = 50.0, 30.0
+        bn, an = iirnotch(f0/nyq, Q)
+        for i in range(X.shape[0]):
+            for j in range(X.shape[1]):
+                X[i, j, :] = filtfilt(bn, an, X[i, j, :])
         # skip other branches
         y = preprocessing.LabelEncoder().fit_transform(y)
         # normalize each channel of each trial over time

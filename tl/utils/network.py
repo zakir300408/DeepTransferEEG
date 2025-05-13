@@ -13,15 +13,17 @@ from models.FC import FC, FC_xy
 
 
 def backbone_net(args, return_type='y'):
-    netF = EEGNet_feature(n_classes=args.class_num,
-                        Chans=args.chn,
-                        Samples=args.time_sample_num,
-                        kernLenght=int(args.sample_rate // 2),
-                        F1=4,
-                        D=2,
-                        F2=8,
-                        dropoutRate=0.25,
-                        norm_rate=0.5)
+    netF = EEGNet_feature(
+        n_classes=args.class_num,
+        Chans=args.chn,
+        Samples=args.time_sample_num,
+        kernLenght=int(args.sample_rate // 2),
+        F1=4,    # increased from 4 → 8
+        D=2,     # increased from 2 → 4
+        F2=8,   # increased from 8 → 16
+        dropoutRate=0.25,
+        norm_rate=0.5
+    )
     if return_type == 'y':
         netC = FC(args.feature_deep_dim, args.class_num)
     elif return_type == 'xy':

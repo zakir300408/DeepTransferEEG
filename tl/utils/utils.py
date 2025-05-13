@@ -248,6 +248,8 @@ def cal_acc_comb(loader, model, flag=True, fc=None, args=None):
             else:
                 all_output = tr.cat((all_output, outputs.float().cpu()), 0)
                 all_label = tr.cat((all_label, labels.float()), 0)
+
+
     all_output = nn.Softmax(dim=1)(all_output)
     _, predict = tr.max(all_output, 1)
     pred = tr.squeeze(predict).float()
