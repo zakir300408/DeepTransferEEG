@@ -5,7 +5,7 @@
 import numpy as np
 import pandas as pd
 from sklearn import preprocessing
-from scipy.signal import butter, filtfilt, iirnotch
+from scipy.signal import butter, filtfilt, iirnotch, spectrogram
 from utils.data_utils import traintest_split_cross_subject, traintest_split_domain_classifier, traintest_split_multisource, traintest_split_domain_classifier_pretest, traintest_split_multisource
 
 
@@ -48,12 +48,28 @@ def data_process(dataset):
             for j in range(X.shape[1]):
                 X[i, j, :] = filtfilt(bn, an, X[i, j, :])
 
-        # apply 8–32 Hz bandpass
-        
-        b, a = butter(5, [4/nyq, 30/nyq], btype='band')
+        # apply a bandpass of 8–32 Hz
+        b, a = butter(5, [8/nyq, 32/nyq], btype='band')
         for i in range(X.shape[0]):
             for j in range(X.shape[1]):
                 X[i, j, :] = filtfilt(b, a, X[i, j, :])
+        
+        # ========== NEW: compute time-frequency features ==========
+        # parameters for spectrogram
+        nperseg, noverlap = 128, 64
+        tf_feats = np.zeros((X.shape[0], X.shape[1],
+                             *(spectrogram(X[0,0], sample_rate, nperseg=nperseg, noverlap=noverlap)[2].shape)))
+        for i in range(X.shape[0]):
+            for j in range(X.shape[1]):
+                f, t, Sxx = spectrogram(X[i, j, :], fs=sample_rate,
+                                         nperseg=nperseg, noverlap=noverlap)
+                tf_feats[i, j] = Sxx  # shape (freq_bins, time_bins)
+        # optionally log‐scale or z-score tf_feats here
+        # flatten tf dims into one axis
+        tf_flat = tf_feats.reshape(X.shape[0], X.shape[1], -1)
+        # concatenate raw time and TF features
+        X = np.concatenate([X, tf_flat], axis=2)
+        # ===========================================================
         
         y = preprocessing.LabelEncoder().fit_transform(y)
         # normalize each channel of each trial over time
@@ -180,6 +196,24 @@ def data_process_secondsession(dataset):
         for i in range(X.shape[0]):
             for j in range(X.shape[1]):
                 X[i, j, :] = filtfilt(bn, an, X[i, j, :])
+
+        # ========== NEW: compute time-frequency features ==========
+        # parameters for spectrogram
+        nperseg, noverlap = 128, 64
+        tf_feats = np.zeros((X.shape[0], X.shape[1],
+                             *(spectrogram(X[0,0], sample_rate, nperseg=nperseg, noverlap=noverlap)[2].shape)))
+        for i in range(X.shape[0]):
+            for j in range(X.shape[1]):
+                f, t, Sxx = spectrogram(X[i, j, :], fs=sample_rate,
+                                         nperseg=nperseg, noverlap=noverlap)
+                tf_feats[i, j] = Sxx  # shape (freq_bins, time_bins)
+        # optionally log‐scale or z-score tf_feats here
+        # flatten tf dims into one axis
+        tf_flat = tf_feats.reshape(X.shape[0], X.shape[1], -1)
+        # concatenate raw time and TF features
+        X = np.concatenate([X, tf_flat], axis=2)
+        # ===========================================================
+
         # skip other branches
         y = preprocessing.LabelEncoder().fit_transform(y)
         # normalize each channel of each trial over time

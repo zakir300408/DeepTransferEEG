@@ -429,9 +429,9 @@ if __name__ == '__main__':
         elif data_name == 'CustomEpoch':
             paradigm = 'MI'
             N = len(subject_names)  # number of unique prefixes/sessions
-            chn, class_num, time_sample_num, sample_rate = 31, 2, 1600, 200
-            # EEGNet output feature dim = F2 * (Samples // (4*8)) = 16 * (1600//32) = 800
-            feature_deep_dim = 400
+            chn, class_num, time_sample_num, sample_rate = 31, 2, 1515, 200
+            # EEGNet output feature dim = F2 * (Samples // 32) = 16 * (1515//32) = 752
+            feature_deep_dim = 16 * (time_sample_num // 32)
             # use actual total trials across all sessions
             import pandas as _pd
             trial_num = int(_pd.read_csv('./data/CustomEpoch/meta.csv')['n_trials'].sum())
@@ -456,10 +456,10 @@ if __name__ == '__main__':
         test_batch = 20
 
         # update step
-        steps = 20
+        steps = 15
 
         # update stride
-        stride = 2
+        stride = 1
 
         # whether to use EA
         align = True
@@ -492,7 +492,7 @@ if __name__ == '__main__':
         total_acc = []
 
         # update multiple models, independently, from the source models
-        for s in [1, 5]:
+        for s in [1]:
             args.SEED = s
 
             fix_random_seed(args.SEED)
