@@ -154,8 +154,18 @@ def fix_random_seed(SEED):
 
 def binary_classification():
     method = 'T-TIME'
-    data_name_list = ['BNCI2014001']
-    # data_name_list = ['BNCI2014001', 'BNCI2014002', 'BNCI2015001']
+    data_name_list = ['CustomEpoch']
+
+    # load session filenames and extract prefixes as in dnn.py
+    df_meta = pd.read_csv('./data/CustomEpoch/meta.csv')
+    # files list from df_meta (‘file’ column, full filenames)
+    files = df_meta['file'].tolist()
+    prefixes = sorted({f.split('_')[0] for f in files})
+    subject_names = prefixes
+
+    # prepare result columns for each prefix
+    sess_cols = [f's{i}' for i in range(len(subject_names))]
+    dct = pd.DataFrame(columns=['dataset','avg','std'] + sess_cols)
 
     for data_name in data_name_list:
 
@@ -168,7 +178,17 @@ def binary_classification():
         if data_name == 'BNCI2014001': paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 9, 22, 2, 1001, 250, 144, 248
         if data_name == 'BNCI2014002': paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 14, 15, 2, 2561, 512, 100, 640
         if data_name == 'BNCI2015001': paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 12, 13, 2, 2561, 512, 200, 640
-
+        if data_name == 'CustomEpoch':
+            paradigm = 'MI'
+            N = len(subject_names)  # number of unique prefixes/sessions
+            chn, class_num, time_sample_num, sample_rate = 31, 2, 1515, 200
+            # F2 * (time_sample_num // 32)
+            feature_deep_dim = 1504
+            # use actual total trials across all sessions
+            import pandas as _pd
+            trial_num = int(_pd.read_csv('./data/CustomEpoch/meta.csv')['n_trials'].sum())
+        else:
+            raise ValueError(f"Unknown data_name {data_name}")
         print('class_num', class_num)
 
         seed_arr = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]

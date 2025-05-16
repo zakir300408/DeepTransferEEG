@@ -10,7 +10,7 @@ from pathlib import Path
 
 def main():
     # Define the root Data_Epoch directory
-    root_dir = Path(r"E:\Exoskeleton_DL\XK_work\Data_Epoch")
+    root_dir = Path(r"E:\Exoskeleton_DL\XK_work\data_epoch_filtered")
 
     # Counters for summary
     processed_count = 0

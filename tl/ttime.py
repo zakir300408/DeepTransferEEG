@@ -3,7 +3,8 @@
 # @Author  : Siyang Li
 # @File    : ttime.py
 import numpy as np
-import argparse
+import argparse 
+
 import os
 import torch
 import torch.nn as nn
@@ -49,6 +50,8 @@ def TTIME(loader, model, args, balanced=True):
 
     iter_test = iter(loader)
 
+    # Initialize data_cum before the loop
+    data_cum = None
     # loop through test data stream one by one
     for i in range(len(loader)):
         #################### Phase 1: target label prediction ####################
@@ -58,7 +61,7 @@ def TTIME(loader, model, args, balanced=True):
         inputs = inputs.reshape(1, 1, inputs.shape[-2], inputs.shape[-1]).to(args.device)
 
         # accumulate test data
-        if i == 0:
+        if data_cum is None:
             data_cum = inputs.float().cpu()
         else:
             data_cum = torch.cat((data_cum, inputs.float().cpu()), 0)
@@ -247,7 +250,15 @@ def train_target(args):
         iter_num = 0
         base_network.train()
 
-        best_acc = 0.0  # track best validation Acc/AUC
+        best_acc = 0.0
+        # define best‐model path with corrected session id string
+        if isinstance(args.idt, (list, tuple)):
+            idt_str = '_'.join(map(str, args.idt))
+        else:
+            idt_str = str(args.idt)
+        best_ckpt = f'./runs/{args.data_name}/{args.backbone}_S{idt_str}_seed{args.SEED}{extra_string}_best.ckpt'
+
+        iter_source = iter(dset_loaders["source"])
         while iter_num < max_iter:
             try:
                 inputs_source, labels_source = next(iter_source)
@@ -273,134 +284,138 @@ def train_target(args):
             optimizer_c.step()
 
             if iter_num % interval_iter == 0 or iter_num == max_iter:
+                # Added print statement for progress reporting
+                epoch_num = iter_num // interval_iter if iter_num < max_iter else args.max_epoch
+                print(f"Epoch {epoch_num}/{args.max_epoch} - Iteration {iter_num}/{max_iter} completed.")
+
                 base_network.eval()
                 if args.balanced:
                     acc_t_te, _ = cal_acc_comb(dset_loaders["Target"], base_network, args=args)
-                    log_str = 'Task: {}, Iter:{}/{}; Offline-EA Acc = {:.2f}%'.format(args.task_str, int(iter_num // len(dset_loaders["source"])), int(max_iter // len(dset_loaders["source"])), acc_t_te)
                 else:
                     acc_t_te, _ = cal_auc_comb(dset_loaders["Target-Imbalanced"], base_network, args=args)
-                    log_str = 'Task: {}, Iter:{}/{}; Offline-EA AUC = {:.2f}%'.format(args.task_str, int(iter_num // len(dset_loaders["source"])), int(max_iter // len(dset_loaders["source"])), acc_t_te)
-                args.log.record(log_str); print(log_str)
-
+                print(f"Validation Accuracy: {acc_t_te:.2f}%")
+                # if this is the best so far, save it
+                if acc_t_te > best_acc:
+                    best_acc = acc_t_te
+                    torch.save(base_network.state_dict(), best_ckpt)
                 base_network.train()
 
-        # after all epochs, save model from last epoch
-        torch.save(base_network.state_dict(),
-                   f'./runs/{args.data_name}/{args.backbone}_S{args.idt}_seed{args.SEED}{extra_string}_last.ckpt')
+        # load the best model (not the last one) before any further evaluation
+        base_network.load_state_dict(torch.load(best_ckpt, map_location=args.device))
 
-        base_network.eval()
+        # global pre-TTA IEA
+        score = cal_score_online(dset_loaders["Target-Online"], base_network, args=args)
+        pre_score = score
+        # per-session Pre-TTA IEA AUC
+        pre_scores = []
+        if args.data == 'CustomEpoch':
+            for idx, (s, e) in enumerate(getattr(args, 'tar_bounds', [])):
+                if e <= s: continue
+                ts = torch.from_numpy(X_tar[s:e]).float()
+                if 'EEGNet' in args.backbone:
+                    ts = ts.unsqueeze(3).permute(0,3,1,2)
+                ys = torch.from_numpy(y_tar[s:e]).long()
+                if args.data_env!='local':
+                    ts,ys = ts.cuda(), ys.cuda()
+                loader = DataLoader(TensorDataset(ts,ys), batch_size=1, shuffle=False)
+                score_s = cal_score_online(loader, base_network, args=args)
+                sess_name = args.session_names[idx]
+                metric = 'Acc' if args.balanced else 'AUC'
+                args.log.record(f"  Pre-TTA IEA Session {sess_name} {metric} = {score_s:.2f}%")
+                print(f"  Pre-TTA IEA Session {sess_name} {metric} = {score_s:.2f}%")
+                pre_scores.append(score_s)
+            pre_score = float(np.mean(pre_scores)) if pre_scores else 0.0
+        else:
+            pre_score = cal_score_online(dset_loaders["Target-Online"], base_network, args=args)
 
-    # global pre-TTA IEA
-    score = cal_score_online(dset_loaders["Target-Online"], base_network, args=args)
-    pre_score = score
-    # per-session Pre-TTA IEA AUC
-    pre_scores = []
-    if args.data == 'CustomEpoch':
+        if args.balanced:
+            log_str = 'Task: {}, Pre-TTA IEA Acc = {:.2f}%'.format(args.task_str, pre_score)
+        else:
+            log_str = 'Task: {}, Pre-TTA IEA AUC = {:.2f}%'.format(args.task_str, pre_score)
+        args.log.record(log_str)
+        print(log_str)
+
+        print('executing TTA per session...')
+        sess_accs = []
+        sess_test_accs = []
         for idx, (s, e) in enumerate(getattr(args, 'tar_bounds', [])):
-            if e <= s: continue
-            ts = torch.from_numpy(X_tar[s:e]).float()
-            if 'EEGNet' in args.backbone:
-                ts = ts.unsqueeze(3).permute(0,3,1,2)
-            ys = torch.from_numpy(y_tar[s:e]).long()
-            if args.data_env!='local':
-                ts,ys = ts.cuda(), ys.cuda()
-            loader = DataLoader(TensorDataset(ts,ys), batch_size=1, shuffle=False)
-            score_s = cal_score_online(loader, base_network, args=args)
             sess_name = args.session_names[idx]
-            metric = 'Acc' if args.balanced else 'AUC'
-            args.log.record(f"  Pre-TTA IEA Session {sess_name} {metric} = {score_s:.2f}%")
-            print(f"  Pre-TTA IEA Session {sess_name} {metric} = {score_s:.2f}%")
-            pre_scores.append(score_s)
-        pre_score = float(np.mean(pre_scores)) if pre_scores else 0.0
-    else:
-        pre_score = cal_score_online(dset_loaders["Target-Online"], base_network, args=args)
+            if e <= s:
+                args.log.record(f"  Session {sess_name} skipped for TTA (no trials)")
+                continue
+            # build per-session tensors
+            ts = torch.from_numpy(X_tar[s:e]).float()
+            ys = torch.from_numpy(y_tar[s:e]).long()
 
-    if args.balanced:
-        log_str = 'Task: {}, Pre-TTA IEA Acc = {:.2f}%'.format(args.task_str, pre_score)
-    else:
-        log_str = 'Task: {}, Pre-TTA IEA AUC = {:.2f}%'.format(args.task_str, pre_score)
-    args.log.record(log_str)
-    print(log_str)
+            # repeat TTA up to 3 times on distinct batches of size max_tta
+            max_tta = 30
+            num_rounds = min(3, len(ts) // max_tta)
 
-    print('executing TTA per session...')
-    sess_accs = []
-    sess_test_accs = []
-    for idx, (s, e) in enumerate(getattr(args, 'tar_bounds', [])):
-        sess_name = args.session_names[idx]
-        if e <= s:
-            args.log.record(f"  Session {sess_name} skipped for TTA (no trials)")
-            continue
-        # build per-session tensors
-        ts = torch.from_numpy(X_tar[s:e]).float()
-        ys = torch.from_numpy(y_tar[s:e]).long()
-
-        # repeat TTA up to 3 times on distinct batches of size max_tta
-        max_tta = 20
-        num_rounds = min(3, len(ts) // max_tta)
-
-        # temp lists for this session
-        round_accs = []
-        round_test_accs = []
-        for r in range(num_rounds):
-            start = r * max_tta
-            end   = start + max_tta
-            ts_tta = ts[start:end]
-            ys_tta = ys[start:end]
-            # the “remaining” are everything before+after this chunk
-            ts_rem = torch.cat([ts[:start], ts[end:]], dim=0)
-            ys_rem = torch.cat([ys[:start], ys[end:]], dim=0)
-            if 'EEGNet' in args.backbone:
-                ts_tta = ts_tta.unsqueeze(3).permute(0, 3, 1, 2)
-                ts_rem = ts_rem.unsqueeze(3).permute(0, 3, 1, 2)
-            if args.data_env != 'local':
-                ts_tta, ys_tta = ts_tta.cuda(), ys_tta.cuda()
-                ts_rem, ys_rem = ts_rem.cuda(), ys_rem.cuda()
-
-            # run TTA on this chunk
-            loader_tta = DataLoader(TensorDataset(ts_tta, ys_tta), batch_size=1, shuffle=False)
-            acc_tta, _, sqrtRefEA = TTIME(loader_tta, base_network, args=args, balanced=args.balanced)
-            args.log.record(f"  Round {r+1} TTA Acc = {acc_tta:.2f}%")
-            print(f"  Round {r+1} TTA Acc = {acc_tta:.2f}%")
-
-            # test on the remaining trials
-            if args.align and len(ts_rem) > 0:
-                # align the remaining trials with latest EA matrix
-                rem_np = ts_rem.squeeze(1).cpu().numpy()   # (n_rem, chn, time)
-                rem_aligned = np.einsum('ij,njt->nit', sqrtRefEA, rem_np)
-                ts_rem = torch.from_numpy(rem_aligned).unsqueeze(1).to(ts_rem.dtype)
+            # temp lists for this session
+            round_accs = []
+            round_test_accs = []
+            for r in range(num_rounds):
+                start = r * max_tta
+                end   = start + max_tta
+                ts_tta = ts[start:end]
+                ys_tta = ys[start:end]
+                # the “remaining” are everything before+after this chunk
+                ts_rem = torch.cat([ts[:start], ts[end:]], dim=0)
+                ys_rem = torch.cat([ys[:start], ys[end:]], dim=0)
+                if 'EEGNet' in args.backbone:
+                    ts_tta = ts_tta.unsqueeze(3).permute(0, 3, 1, 2)
+                    ts_rem = ts_rem.unsqueeze(3).permute(0, 3, 1, 2)
                 if args.data_env != 'local':
-                    ts_rem = ts_rem.cuda()
-            loader_rem = DataLoader(TensorDataset(ts_rem, ys_rem), batch_size=1, shuffle=False)
+                    ts_tta, ys_tta = ts_tta.cuda(), ys_tta.cuda()
+                    ts_rem, ys_rem = ts_rem.cuda(), ys_rem.cuda()
 
-            if args.balanced:
-                acc_rem, _ = cal_acc_comb(loader_rem, base_network, args=args)
-            else:
-                acc_rem = cal_score_online(loader_rem, base_network, args=args)
-            args.log.record(f"  Round {r+1} post-TTA test Acc = {acc_rem:.2f}%")
-            print(f"  Round {r+1} post-TTA test Acc = {acc_rem:.2f}%")
-            round_accs.append(acc_tta)
-            round_test_accs.append(acc_rem)
-        # average over rounds for this session
-        if round_accs:
-            sess_accs.append(float(np.mean(round_accs)))
-            sess_test_accs.append(float(np.mean(round_test_accs)))
-    # overall average across sessions
-    acc_t_te = float(np.mean(sess_accs)) if sess_accs else 0.0
-    acc_test = float(np.mean(sess_test_accs)) if sess_test_accs else 0.0
-    log_str = f"Task: {args.task_str}, Overall TTA {'Acc' if args.balanced else 'AUC'} = {acc_t_te:.2f}%"
-    args.log.record(log_str)
-    print(log_str)
-    args.log.record(f"Task: {args.task_str}, Overall post-TTA test {'Acc' if args.balanced else 'AUC'} = {acc_test:.2f}%")
-    print(f"Overall post-TTA test {'Acc' if args.balanced else 'AUC'} = {acc_test:.2f}%")
+                # run TTA on this chunk
+                loader_tta = DataLoader(TensorDataset(ts_tta, ys_tta), batch_size=1, shuffle=False)
+                acc_tta, _, sqrtRefEA = TTIME(loader_tta, base_network, args=args, balanced=args.balanced)
+                args.log.record(f"  Round {r+1} TTA Acc = {acc_tta:.2f}%")
+                print(f"  Round {r+1} TTA Acc = {acc_tta:.2f}%")
 
-    torch.save(base_network.state_dict(), './runs/' + str(args.data_name) + '/' + str(args.backbone) + '_S' + str(args.idt) + '_seed' + str(
-        args.SEED) + extra_string + '_adapted' + '.ckpt')
+                # test on the remaining trials
+                if args.align and len(ts_rem) > 0:
+                    # align the remaining trials with latest EA matrix
+                    rem_np = ts_rem.squeeze(1).cpu().numpy()   # (n_rem, chn, time)
+                    rem_aligned = np.einsum('ij,njt->nit', sqrtRefEA, rem_np)
+                    ts_rem = torch.from_numpy(rem_aligned).unsqueeze(1).to(ts_rem.dtype)
+                    if args.data_env != 'local':
+                        ts_rem = ts_rem.cuda()
+                loader_rem = DataLoader(TensorDataset(ts_rem, ys_rem), batch_size=1, shuffle=False)
 
-    gc.collect()
-    if args.data_env != 'local':
-        torch.cuda.empty_cache()
+                if args.balanced:
+                    acc_rem, _ = cal_acc_comb(loader_rem, base_network, args=args)
+                else:
+                    acc_rem = cal_score_online(loader_rem, base_network, args=args)
+                args.log.record(f"  Round {r+1} post-TTA test Acc = {acc_rem:.2f}%")
+                print(f"  Round {r+1} post-TTA test Acc = {acc_rem:.2f}%")
+                round_accs.append(acc_tta)
+                round_test_accs.append(acc_rem)
+            # average over rounds for this session
+            if round_accs:
+                sess_accs.append(float(np.mean(round_accs)))
+                sess_test_accs.append(float(np.mean(round_test_accs)))
+        # overall average across sessions
+        acc_t_te = float(np.mean(sess_accs)) if sess_accs else 0.0
+        acc_test = float(np.mean(sess_test_accs)) if sess_test_accs else 0.0
+        log_str = f"Task: {args.task_str}, Overall TTA {'Acc' if args.balanced else 'AUC'} = {acc_t_te:.2f}%"
+        args.log.record(log_str)
+        print(log_str)
+        args.log.record(f"Task: {args.task_str}, Overall post-TTA test {'Acc' if args.balanced else 'AUC'} = {acc_test:.2f}%")
+        print(f"Overall post-TTA test {'Acc' if args.balanced else 'AUC'} = {acc_test:.2f}%")
 
-    return acc_t_te, pre_score, acc_test
+        # Save the adapted model using the corrected id string
+        torch.save(base_network.state_dict(), './runs/' + str(args.data_name) + '/' +
+                   str(args.backbone) + '_S' + idt_str + '_seed' + str(args.SEED) +
+                   extra_string + '_adapted' + '.ckpt')
+
+        gc.collect()
+        if args.data_env != 'local':
+            torch.cuda.empty_cache()
+
+        return acc_t_te, pre_score, acc_test
 
 
 if __name__ == '__main__':
@@ -430,8 +445,8 @@ if __name__ == '__main__':
             paradigm = 'MI'
             N = len(subject_names)  # number of unique prefixes/sessions
             chn, class_num, time_sample_num, sample_rate = 31, 2, 1515, 200
-            # EEGNet output feature dim = F2 * (Samples // 32) = 16 * (1515//32) = 752
-            feature_deep_dim = 16 * (time_sample_num // 32)
+            # F2 * (time_sample_num // 32)
+            feature_deep_dim = 1504
             # use actual total trials across all sessions
             import pandas as _pd
             trial_num = int(_pd.read_csv('./data/CustomEpoch/meta.csv')['n_trials'].sum())
@@ -453,10 +468,10 @@ if __name__ == '__main__':
         lr = 0.001
 
         # test batch size
-        test_batch = 20
+        test_batch = 10
 
         # update step
-        steps = 15
+        steps = 5
 
         # update stride
         stride = 1
@@ -492,7 +507,7 @@ if __name__ == '__main__':
         total_acc = []
 
         # update multiple models, independently, from the source models
-        for s in [1]:
+        for s in [2,3,4,5,6,7]:
             args.SEED = s
 
             fix_random_seed(args.SEED)
@@ -538,12 +553,12 @@ if __name__ == '__main__':
                 pre_acc_all[idt] = pre_acc
                 post_acc_all[idt] = post_acc
 
-            print('Sub acc: ', np.round(sub_acc_all, 3))
-            print('Avg acc: ', np.round(np.mean(sub_acc_all), 3))
-            print('Sub pre-TTA IEA Acc: ', np.round(pre_acc_all, 3))
-            print('Avg pre-TTA IEA Acc: ', np.round(np.mean(pre_acc_all), 3))
-            print('Sub post-TTA test AUC: ', np.round(post_acc_all, 3))
-            print('Avg post-TTA test AUC: ', np.round(np.mean(post_acc_all), 3))
+            print('Subject TTA Accuracy for each session: ', np.round(sub_acc_all, 3))
+            print('Average TTA Accuracy: ', np.round(np.mean(sub_acc_all), 3))
+            print('Subject Pre-TTA IEA Accuracy for each session: ', np.round(pre_acc_all, 3))
+            print('Average Pre-TTA IEA Accuracy: ', np.round(np.mean(pre_acc_all), 3))
+            print('Subject Post-TTA Test AUC for each session: ', np.round(post_acc_all, 3))
+            print('Average Post-TTA Test AUC: ', np.round(np.mean(post_acc_all), 3))
 
             total_acc.append(sub_acc_all)
 

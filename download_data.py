@@ -14,6 +14,11 @@ from moabb.paradigms import MotorImagery, P300
 MAX_RETRIES = 3
 RETRY_DELAY = 5  # seconds
 
+# Add slicing constants
+IGNORE_START_SECONDS_CUSTOM = 2
+IGNORE_END_SECONDS_CUSTOM   = 2
+SAMPLE_RATE_CUSTOM = 200
+
 
 def dataset_to_file(dataset_name, data_save):
     moabb.set_log_level("ERROR")
@@ -30,15 +35,23 @@ def dataset_to_file(dataset_name, data_save):
         paradigm = MotorImagery(n_classes=2)
         # (5600, 13, 2561) (5600,) 512Hz 12subjects * 2 classes * (200 + 200 + (200 for Subj 8/9/10/11)) trials * (2/3)sessions
     elif dataset_name == 'CustomEpoch':
-        root_dir = r"E:\Exoskeleton_DL\XK_work\Data_Epoch"
+        root_dir = r"E:\Exoskeleton_DL\XK_work\data_epoch_filtered"
         mat_files = sorted(glob.glob(os.path.join(root_dir, "*", "*.mat")))
         if not mat_files:
             raise ValueError(f"No .mat files found in CustomEpoch path {root_dir}")
         all_X, all_y, meta_rows = [], [], []
         for fn in mat_files:
             mat = loadmat(fn)
-            X = mat['MyEpoch']                   # (n_trials, samples, channels)
-            X = X.transpose(0, 2, 1)             # to (n_trials, channels, samples)
+            raw_X = mat['MyEpoch']               # (n_trials, samples, channels)
+            orig_samples = raw_X.shape[1]
+            X = raw_X.transpose(0, 2, 1)         # to (n_trials, channels, samples)
+            # ignore first 1.5s and last 2.5s of each epoch
+            ignore_start = int(IGNORE_START_SECONDS_CUSTOM * SAMPLE_RATE_CUSTOM)
+            ignore_end   = int(IGNORE_END_SECONDS_CUSTOM   * SAMPLE_RATE_CUSTOM)
+            X = X[:, :, ignore_start:-ignore_end]
+            # print samples before and after truncation
+            print(f"{os.path.basename(fn)}: original samples per trial = {orig_samples}, "
+                  f"after truncation = {X.shape[2]}")
             y = mat['MyLabel'].flatten()
             all_X.append(X)
             all_y.append(y)
