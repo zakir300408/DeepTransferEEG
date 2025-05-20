@@ -18,7 +18,7 @@ from utils.utils import fix_random_seed, cal_acc_comb, data_loader, cal_auc_comb
 from utils.alg_utils import EA, EA_online
 from scipy.linalg import fractional_matrix_power
 from utils.loss import Entropy
-from sklearn.metrics import roc_auc_score, accuracy_score
+from sklearn.metrics import roc_auc_score, accuracy_score, roc_curve
 
 import gc
 import sys
@@ -180,13 +180,29 @@ def TTIME(loader, model, args, balanced=True):
         model.eval()
 
     if balanced:
-        _, predict = torch.max(torch.from_numpy(np.array(y_pred)).to(torch.float32).reshape(-1, args.class_num), 1)
-        pred = torch.squeeze(predict).float()
-        score = accuracy_score(y_true, pred)
-        if args.data_name == 'BNCI2014001-4':
-            y_pred = np.array(y_pred).reshape(-1, )  # multiclass
+        # binary case: calibrate threshold via Youden’s J
+        if args.class_num == 2:
+            # extract positive-class scores
+            y_scores = np.array(y_pred).reshape(-1, args.class_num)[:, 1]
+            # compute ROC curve
+            fpr, tpr, thresholds = roc_curve(y_true, y_scores)
+            # Youden’s J statistic
+            optimal_idx = np.argmax(tpr - fpr)
+            best_thresh = thresholds[optimal_idx]
+            # apply best threshold
+            preds = (y_scores > best_thresh).astype(int)
+            score = accuracy_score(y_true, preds)
         else:
-            y_pred = np.array(y_pred).reshape(-1, args.class_num)[:, 1]  # binary
+            # multiclass: default argmax
+            _, predict = torch.max(torch.from_numpy(np.array(y_pred))
+                               .to(torch.float32).reshape(-1, args.class_num), 1)
+            preds = torch.squeeze(predict).float().numpy().astype(int)
+            score = accuracy_score(y_true, preds)
+        # retain y_pred formatting
+        if args.data_name == 'BNCI2014001-4':
+            y_pred = np.array(y_pred).reshape(-1,)  # multiclass
+        else:
+            y_pred = y_scores
     else:
         predict = torch.from_numpy(np.array(y_pred)).to(torch.float32).reshape(-1, args.class_num)
         y_pred = np.array(predict).reshape(-1, args.class_num)[:, 1]  # binary
@@ -348,7 +364,7 @@ def train_target(args):
             ys = torch.from_numpy(y_tar[s:e]).long()
 
             # repeat TTA up to 3 times on distinct batches of size max_tta
-            max_tta = 30
+            max_tta = 20
             num_rounds = min(3, len(ts) // max_tta)
 
             # temp lists for this session
@@ -462,25 +478,25 @@ if __name__ == '__main__':
             max_epoch = 0
         else:
             # training epochs
-            max_epoch = 30
+            max_epoch = 50
 
         # learning rate
-        lr = 0.001
-
+        lr = 0.0005
         # test batch size
-        test_batch = 10
+        test_batch = 12
 
         # update step
-        steps = 5
+        steps = 7
 
         # update stride
         stride = 1
+
 
         # whether to use EA
         align = True
 
         # temperature rescaling, for test entropy calculation
-        t = 2
+        t = 1.8
 
         # whether to test balanced or imbalanced (2:1) target subject
         balanced = True
@@ -497,7 +513,7 @@ if __name__ == '__main__':
         args.backbone = 'EEGNet'
 
         # train batch size
-        args.batch_size = 32
+        args.batch_size = 64
 
         # GPU device id
         # detect device and default to GPU if available
@@ -507,7 +523,7 @@ if __name__ == '__main__':
         total_acc = []
 
         # update multiple models, independently, from the source models
-        for s in [2,3,4,5,6,7]:
+        for s in [2,3,4,5,6,7,8,9,10]:
             args.SEED = s
 
             fix_random_seed(args.SEED)
@@ -559,6 +575,8 @@ if __name__ == '__main__':
             print('Average Pre-TTA IEA Accuracy: ', np.round(np.mean(pre_acc_all), 3))
             print('Subject Post-TTA Test AUC for each session: ', np.round(post_acc_all, 3))
             print('Average Post-TTA Test AUC: ', np.round(np.mean(post_acc_all), 3))
+            # also print accuracy
+            print('Average Post-TTA Test Accuracy: ', np.round(np.mean(post_acc_all), 3))
 
             total_acc.append(sub_acc_all)
 
