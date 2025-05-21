@@ -11,6 +11,9 @@ import torch.utils.data
 from sklearn.metrics import accuracy_score
 from utils.dataloader import data_process
 import warnings
+import itertools
+from pandas.errors import ParserError
+
 warnings.filterwarnings("ignore")
 
 
@@ -154,18 +157,7 @@ def fix_random_seed(SEED):
 
 def binary_classification():
     method = 'T-TIME'
-    data_name_list = ['CustomEpoch']
-
-    # load session filenames and extract prefixes as in dnn.py
-    df_meta = pd.read_csv('./data/CustomEpoch/meta.csv')
-    # files list from df_meta (‘file’ column, full filenames)
-    files = df_meta['file'].tolist()
-    prefixes = sorted({f.split('_')[0] for f in files})
-    subject_names = prefixes
-
-    # prepare result columns for each prefix
-    sess_cols = [f's{i}' for i in range(len(subject_names))]
-    dct = pd.DataFrame(columns=['dataset','avg','std'] + sess_cols)
+    data_name_list = [ 'CustomEpoch']  # add CustomEpoch
 
     for data_name in data_name_list:
 
@@ -175,33 +167,62 @@ def binary_classification():
 
         total_mean = [[], [], [], []]
 
-        if data_name == 'BNCI2014001': paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 9, 22, 2, 1001, 250, 144, 248
+        if data_name == 'BNCI2014001':
+            paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 9, 22, 2, 1001, 250, 144, 248
         if data_name == 'BNCI2014002': paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 14, 15, 2, 2561, 512, 100, 640
         if data_name == 'BNCI2015001': paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 12, 13, 2, 2561, 512, 200, 640
-        if data_name == 'CustomEpoch':
+        elif data_name == 'CustomEpoch':
             paradigm = 'MI'
-            N = len(subject_names)  # number of unique prefixes/sessions
-            chn, class_num, time_sample_num, sample_rate = 31, 2, 1515, 200
-            # F2 * (time_sample_num // 32)
-            feature_deep_dim = 1504
-            # use actual total trials across all sessions
-            import pandas as _pd
-            trial_num = int(_pd.read_csv('./data/CustomEpoch/meta.csv')['n_trials'].sum())
-        else:
-            raise ValueError(f"Unknown data_name {data_name}")
+            N = num_subjects
+            chn = ch_num
+            class_num = 2                  # binary only
+            time_sample_num = X.shape[2]
+            trial_num = int(X.shape[0] / num_subjects)  # assume equal trials per subject
+            # sample_rate, feature_deep_dim not used below
+
         print('class_num', class_num)
 
-        seed_arr = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        seed_arr = [2,3,11]  # match seeds used in ttime.py
         preds = []
         for SEED in seed_arr:
             path = './logs/' + str(data_name) + '_'+ str(method) + '_seed_' + str(SEED) + "_pred.csv"
-            df = pd.read_csv(path, header=None)
+            print(f"DEBUG: Attempting to read CSV '{path}'")
+            try:
+                df = pd.read_csv(path, header=None, sep=",")
+            except ParserError as e:
+                print(f"DEBUG: ParserError for file {path}: {e}")
+                print("DEBUG: Inspecting first 10 lines and their column counts:")
+                with open(path, 'r') as fh:
+                    for idx, line in enumerate(itertools.islice(fh, 10)):
+                        cols = line.rstrip('\n').split(',')
+                        print(f"  Line {idx+1}: {len(cols)} columns")
+                raise
             preds.append(df.to_numpy())
 
-        preds = np.stack(preds)  # (num_models, num_subjects, num_test_samples)
-        print('test set preds shape:', preds.shape)
+        preds = np.stack(preds)  # (num_models, num_sessions, sess_trials)
+        print('test set preds shape (models, sessions, sess_trials):', preds.shape)
 
-        for ens_num in range(3, 11):
+        # For CustomEpoch, group every 2 sessions (rows) into one subject.
+        if data_name == 'CustomEpoch':
+            num_sessions = preds.shape[1]
+            if num_sessions % 2 != 0:
+                print("WARNING: Expected an even number of sessions but got", num_sessions)
+            num_subjects = num_sessions // 2
+            subj_preds = []
+            for s in range(num_subjects):
+                # concatenate sessions 2*s and 2*s+1 along the trial axis
+                merged = np.concatenate([preds[:, 2*s, :], preds[:, 2*s+1, :]], axis=1)
+                subj_preds.append(merged)  # shape (num_models, trials_per_subject)
+            preds = np.stack(subj_preds, axis=1)  # (num_models, num_subjects, trials_per_subject)
+            print('DEBUG_ensemble: after grouping, preds shape (models, subjects, trials):', preds.shape)
+
+        # override subject & trial counts to match the loaded preds
+        num_subjects = preds.shape[1]
+        trial_num    = preds.shape[2]
+        # debug: report ensemble dimensions
+        print(f"DEBUG_ensemble: detected num_subjects={num_subjects}, trials_per_subject={trial_num}")
+
+        for ens_num in range(3, len(seed_arr) + 1):  # up to available models
 
             print('Ensembling of ' + str(ens_num) + ' models...')
 
@@ -210,7 +231,8 @@ def binary_classification():
             acc_sml = []
 
             for subj in range(num_subjects):
-
+                # debug: per‐subject index and trial count
+                print(f"DEBUG_ensemble: processing subject {subj} with {trial_num} trials")
                 pred = preds[:, subj, :]  # (num_models, num_test_samples)
                 true = y[np.arange(trial_num).astype(int) + trial_num * subj]
                 test_trial_num = trial_num
@@ -218,10 +240,8 @@ def binary_classification():
                 # average
                 seed_acc = []
                 for i in range(10):
-                    ens_ids = np.arange(ens_num).astype(int) + i + 1
-                    for k in range(len(ens_ids)):
-                        if ens_ids[k] >= 11:
-                            ens_ids[k] -= 11
+                    # wrap indices to available models
+                    ens_ids = (np.arange(ens_num) + i) % pred.shape[0]
                     ens_pred = np.average(pred[ens_ids, :], axis=0)
                     ens_prediction = convert_label(ens_pred, 0, 0.5)
                     ens_score = accuracy_score(true, ens_prediction)
@@ -231,10 +251,8 @@ def binary_classification():
                 # voting
                 seed_acc = []
                 for i in range(10):
-                    ens_ids = np.arange(ens_num).astype(int) + i + 1
-                    for k in range(len(ens_ids)):
-                        if ens_ids[k] >= 11:
-                            ens_ids[k] -= 11
+                    # wrap indices to available models
+                    ens_ids = (np.arange(ens_num) + i) % pred.shape[0]
                     votes = []
                     for id_ in ens_ids:
                         vote_single = convert_label(pred[id_, :], 0, 0.5)
@@ -248,17 +266,15 @@ def binary_classification():
                 # SML
                 seed_acc = []
                 for i in range(10):
-                    ens_ids = np.arange(ens_num).astype(int) + i + 1
-                    for k in range(len(ens_ids)):
-                        if ens_ids[k] >= 11:
-                            ens_ids[k] -= 11
+                    # wrap indices to available models
+                    ens_ids = (np.arange(ens_num) + i) % pred.shape[0]
                     ens_prediction = []
                     for sample in range(test_trial_num):
                         if sample < ens_num:
                             ens_pred = np.average(pred[ens_ids, sample], axis=0)
                             curr_pred = convert_label(ens_pred, 0, 0.5).item()
                         else:
-                            curr_table = pred[ens_ids, :sample + 1]
+                            curr_table = pred[ens_ids, : sample + 1]
                             curr_pred = SML(curr_table)[-1]
                         ens_prediction.append(curr_pred)
                     ens_score = accuracy_score(true, ens_prediction)
@@ -290,127 +306,8 @@ def binary_classification():
         print(total_mean)
 
 
-def multiclass_classification():
-    method = 'T-TIME'
-    data_name_list = ['BNCI2014001-4']
-
-    for data_name in data_name_list:
-
-        print(data_name)
-
-        X, y, num_subjects, paradigm, sample_rate, ch_num = data_process(data_name)
-
-        total_mean = [[], [], []]
-
-        paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 9, 22, 4, 1001, 250, 288, 248
-
-        print('class_num', class_num)
-
-        seed_arr = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-        preds = []
-        for SEED in seed_arr:
-            path = './logs/' + str(data_name) + '_' + str(method) + '_seed_' + str(SEED) + "_pred.csv"
-            df = pd.read_csv(path, header=None)
-            preds.append(df.to_numpy())
-
-        preds = np.stack(preds)  # (num_models, num_subjects, num_test_samples)
-        preds = preds.reshape(len(seed_arr), N, trial_num, class_num)
-        print('test set preds shape:', preds.shape)
-
-        for ens_num in range(3, 11):
-
-            print('Ensembling of ' + str(ens_num) + ' models...')
-
-            acc_avg = []
-            acc_vote = []
-            acc_smlpred = []
-
-            for subj in range(num_subjects):
-
-                pred = preds[:, subj, :, :]
-                true = y[np.arange(trial_num).astype(int) + trial_num * subj]
-                test_trial_num = trial_num
-
-                # average
-                seed_acc = []
-                for i in range(10):
-                    ens_ids = np.arange(ens_num).astype(int) + i + 1
-                    for k in range(len(ens_ids)):
-                        if ens_ids[k] >= 11:
-                            ens_ids[k] -= 11
-                    ens_pred = np.average(pred[ens_ids], axis=0)
-                    ens_pred = np.argmax(ens_pred, axis=-1)
-                    ens_score = accuracy_score(true, ens_pred)
-                    seed_acc.append(ens_score)
-                acc_avg.append(seed_acc)
-
-                # voting
-                seed_acc = []
-                for i in range(10):
-                    ens_ids = np.arange(ens_num).astype(int) + i + 1
-                    for k in range(len(ens_ids)):
-                        if ens_ids[k] >= 11:
-                            ens_ids[k] -= 11
-                    votes = []
-                    for id_ in ens_ids:
-                        vote_single = np.argmax(pred[id_, :, :], axis=-1)
-                        votes.append(vote_single)
-                    votes = np.stack(votes)
-                    ens_prediction = voting_ensemble_multiclass(votes, n_classes=class_num)
-                    ens_score = accuracy_score(true, ens_prediction)
-                    seed_acc.append(ens_score)
-                acc_vote.append(seed_acc)
-
-                # SML multi-class (TTA models)
-                seed_acc = []
-                for i in range(10):
-                    ens_ids = np.arange(ens_num).astype(int) + i + 1
-                    for k in range(len(ens_ids)):
-                        if ens_ids[k] >= 11:
-                            ens_ids[k] -= 11
-                    ens_prediction = []
-                    for sample in range(test_trial_num):
-                        if sample < ens_num:
-                            ens_pred = np.average(pred[ens_ids, sample, :], axis=0)
-                            curr_pred = np.argmax(ens_pred, axis=-1)
-                        else:
-                            curr_table = pred[ens_ids, :sample + 1, :]
-                            curr_pred = SML_multiclass(curr_table, class_num)[-1]
-                        ens_prediction.append(curr_pred)
-                    ens_score = accuracy_score(true, ens_prediction)
-                    seed_acc.append(ens_score)
-                acc_smlpred.append(seed_acc)
-
-            method_cnt = 0
-            for score in [acc_avg, acc_vote, acc_smlpred]:
-
-                if method_cnt == 0:
-                    print('###############Average Ensemble###############')
-                if method_cnt == 1:
-                    print('###############Voting Ensemble################')
-                if method_cnt == 2:
-                    print('###############SML (multi-class) Ensemble###############')
-
-                score = np.array(score).transpose((1, 0))
-                subject_mean = np.round(np.average(score, axis=0) * 100, 2)
-                dataset_mean = np.round(np.average(np.average(score)) * 100, 2)
-                dataset_std = np.round(np.std(np.average(score, axis=1)) * 100, 2)
-
-                print(subject_mean)
-                print(dataset_mean)
-                print(dataset_std)
-
-                total_mean[method_cnt].append(dataset_mean)
-
-                method_cnt += 1
-
-        print(total_mean)
 
 
 if __name__ == '__main__':
     fix_random_seed(42)
     binary_classification()
-    multiclass_classification()
-
-
-

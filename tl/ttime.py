@@ -19,12 +19,16 @@ from utils.alg_utils import EA, EA_online
 from scipy.linalg import fractional_matrix_power
 from utils.loss import Entropy
 from sklearn.metrics import roc_auc_score, accuracy_score, roc_curve
+from ttime_ensemble import SML                # << add this import
 
 import gc
 import sys
 import time
 from torch.utils.data import DataLoader, TensorDataset
 
+# Add once: prepare_loader helper to avoid recreating DataLoader inline
+def prepare_loader(data, targets, batch_size):
+    return DataLoader(TensorDataset(data, targets), batch_size=batch_size, shuffle=False)
 
 def TTIME(loader, model, args, balanced=True):
     # "T-TIME: Test-Time Information Maximization Ensemble for Plug-and-Play BCIs"
@@ -39,6 +43,7 @@ def TTIME(loader, model, args, balanced=True):
     y_pred = []
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    
 
     # initialize test reference matrix for Incremental EA
     if args.align:
@@ -247,14 +252,88 @@ def train_target(args):
     netF, netC = netF.to(args.device), netC.to(args.device)
     base_network = nn.Sequential(netF, netC).to(args.device)
 
+    # helper for per‐session summary
+    def _log_session_summary(ttas, posts):
+        print('Subject per-session TTA Accuracies:', np.round(ttas, 3))
+        args.log.record(f"Subject per-session TTA Accuracies: {np.round(ttas, 3)}")
+        print('Subject per-session Post-TTA Accuracies:', np.round(posts, 3))
+        args.log.record(f"Subject per-session Post-TTA Accuracies: {np.round(posts, 3)}")
+
     if args.max_epoch == 0:
-        if args.align:
-            if args.data_env != 'local':
-                base_network.load_state_dict(torch.load('./runs/' + str(args.data_name) + '/' + str(args.backbone) +
-                    '_S' + str(args.idt) + '_seed' + str(args.SEED) + extra_string + '.ckpt'))
+        # generate correct id string for loading pretrained model
+        if isinstance(args.idt, (list, tuple)):
+            idt_str = '_'.join(map(str, args.idt))
+        else:
+            idt_str = str(args.idt)
+        if args.data_env != 'local':
+            base_network.load_state_dict(torch.load(
+                f'./runs/{args.data_name}/{args.backbone}_S{idt_str}_seed{args.SEED}{extra_string}_best.ckpt'))
+        else:
+            base_network.load_state_dict(torch.load(
+                f'./runs/{args.data_name}/{args.backbone}_S{idt_str}_seed{args.SEED}{extra_string}_best.ckpt',
+                map_location=torch.device('cpu')))
+        # perform a quick evaluation and print results
+        if args.balanced:
+            acc_val, _ = cal_acc_comb(dset_loaders["Target"], base_network, args=args)
+            metric = "Acc"
+        else:
+            acc_val = cal_score_online(dset_loaders["Target-Imbalanced"], base_network, args=args)
+            metric = "AUC"
+        print(f"Task: {args.task_str}, Pre-TTA IEA {metric} = {acc_val:.2f}%")
+        args.log.record(f"Task: {args.task_str}, Pre-TTA IEA {metric} = {acc_val:.2f}%")
+
+        # after loading best model, save Pre-TTA probabilities
+        loader_pre = DataLoader(
+            TensorDataset(torch.from_numpy(X_tar).float(),
+                          torch.from_numpy(y_tar).long()),
+            batch_size=1, shuffle=False
+        )
+        pre_probs = []
+        base_network.eval()
+        for x_pre, _ in loader_pre:
+            # reshape to (1,1,chn,time) for EEGNet
+            x_in = x_pre
+            if 'EEGNet' in args.backbone:
+                x_in = x_in.unsqueeze(3).permute(0,3,1,2)
+            with torch.no_grad():
+                _, out_pre = base_network(x_in.to(args.device))
+                prob_pre = nn.Softmax(dim=1)(out_pre).cpu().numpy().squeeze()
+            pre_probs.append(prob_pre)
+        pre_probs = np.stack(pre_probs)  # shape (n_trials, class_num)
+        np.savetxt(
+            os.path.join(args.result_dir,
+                         f"{args.data_name}_T-TIME_seed_{args.SEED}_pre_probs.csv"),
+            pre_probs, delimiter=",",
+        )
+
+        # ─── now use helper instead of inline loop ─────────────────────────
+        avg_tta, avg_post = run_chunked_tta(base_network, X_tar, y_tar, args, idt_str, extra_string)
+        # define & save final adapted model
+        best_ckpt_adapted = f'./runs/{args.data_name}/{args.backbone}_S{idt_str}_seed{args.SEED}{extra_string}_adapted.ckpt'
+        torch.save(base_network.state_dict(), best_ckpt_adapted)
+
+        # ─── dump per-seed predictions ─────────────────────────────────────────
+        loader_all = DataLoader(
+            TensorDataset(torch.from_numpy(X_tar).float(),
+                          torch.from_numpy(y_tar).long()),
+            batch_size=1, shuffle=False
+        )
+        _, y_pred_full, _ = TTIME(loader_all, base_network,
+                                  args=args, balanced=args.balanced)
+        # For CustomEpoch, output predictions one row per session.
+        # write per-session predictions to CSV (handles varying lengths)
+        out_path = os.path.join(args.result_dir,
+                                f"{args.data_name}_T-TIME_seed_{args.SEED}_pred.csv")
+        with open(out_path, 'w') as fw:
+            if args.data_name == 'CustomEpoch':
+                for start, end in args.tar_bounds:
+                    row = y_pred_full[start:end]
+                    fw.write(','.join(map(str, row.tolist())) + '\n')
             else:
-                base_network.load_state_dict(torch.load('./runs/' + str(args.data_name) + '/' + str(args.backbone) +
-                    '_S' + str(args.idt) + '_seed' + str(args.SEED) + extra_string + '.ckpt', map_location=torch.device('cpu')))
+                # flat array case
+                fw.write(','.join(map(str, y_pred_full.tolist())) + '\n')
+        return avg_tta, acc_val, avg_post
+
     else:
         criterion = nn.CrossEntropyLoss()
         optimizer_f = optim.Adam(netF.parameters(), lr=args.lr)
@@ -273,6 +352,8 @@ def train_target(args):
         else:
             idt_str = str(args.idt)
         best_ckpt = f'./runs/{args.data_name}/{args.backbone}_S{idt_str}_seed{args.SEED}{extra_string}_best.ckpt'
+        # define adapted‐model path
+        best_ckpt_adapted = f'./runs/{args.data_name}/{args.backbone}_S{idt_str}_seed{args.SEED}{extra_string}_adapted.ckpt'
 
         iter_source = iter(dset_loaders["source"])
         while iter_num < max_iter:
@@ -320,118 +401,176 @@ def train_target(args):
         base_network.load_state_dict(torch.load(best_ckpt, map_location=args.device))
 
         # global pre-TTA IEA
-        score = cal_score_online(dset_loaders["Target-Online"], base_network, args=args)
-        pre_score = score
-        # per-session Pre-TTA IEA AUC
-        pre_scores = []
-        if args.data == 'CustomEpoch':
-            for idx, (s, e) in enumerate(getattr(args, 'tar_bounds', [])):
-                if e <= s: continue
-                ts = torch.from_numpy(X_tar[s:e]).float()
-                if 'EEGNet' in args.backbone:
-                    ts = ts.unsqueeze(3).permute(0,3,1,2)
-                ys = torch.from_numpy(y_tar[s:e]).long()
-                if args.data_env!='local':
-                    ts,ys = ts.cuda(), ys.cuda()
-                loader = DataLoader(TensorDataset(ts,ys), batch_size=1, shuffle=False)
-                score_s = cal_score_online(loader, base_network, args=args)
-                sess_name = args.session_names[idx]
-                metric = 'Acc' if args.balanced else 'AUC'
-                args.log.record(f"  Pre-TTA IEA Session {sess_name} {metric} = {score_s:.2f}%")
-                print(f"  Pre-TTA IEA Session {sess_name} {metric} = {score_s:.2f}%")
-                pre_scores.append(score_s)
-            pre_score = float(np.mean(pre_scores)) if pre_scores else 0.0
-        else:
-            pre_score = cal_score_online(dset_loaders["Target-Online"], base_network, args=args)
+        pre_score = cal_score_online(dset_loaders["Target-Online"], base_network, args=args)
+        metric = 'Acc' if args.balanced else 'AUC'
+        print(f"Task: {args.task_str}, Pre-TTA IEA {metric} = {pre_score:.2f}%")
+        args.log.record(f"Task: {args.task_str}, Pre-TTA IEA {metric} = {pre_score:.2f}%")
 
-        if args.balanced:
-            log_str = 'Task: {}, Pre-TTA IEA Acc = {:.2f}%'.format(args.task_str, pre_score)
-        else:
-            log_str = 'Task: {}, Pre-TTA IEA AUC = {:.2f}%'.format(args.task_str, pre_score)
-        args.log.record(log_str)
-        print(log_str)
+        # after loading best model, save Pre-TTA probabilities
+        loader_pre = DataLoader(
+            TensorDataset(torch.from_numpy(X_tar).float(),
+                          torch.from_numpy(y_tar).long()),
+            batch_size=1, shuffle=False
+        )
+        pre_probs = []
+        base_network.eval()
+        for x_pre, _ in loader_pre:
+            # reshape to (1,1,chn,time) for EEGNet
+            x_in = x_pre
+            if 'EEGNet' in args.backbone:
+                x_in = x_in.unsqueeze(3).permute(0,3,1,2)
+            with torch.no_grad():
+                _, out_pre = base_network(x_in.to(args.device))
+                prob_pre = nn.Softmax(dim=1)(out_pre).cpu().numpy().squeeze()
+            pre_probs.append(prob_pre)
+        pre_probs = np.stack(pre_probs)  # shape (n_trials, class_num)
+        np.savetxt(
+            os.path.join(args.result_dir,
+                         f"{args.data_name}_T-TIME_seed_{args.SEED}_pre_probs.csv"),
+            pre_probs, delimiter=",",
+        )
 
-        print('executing TTA per session...')
-        sess_accs = []
-        sess_test_accs = []
-        for idx, (s, e) in enumerate(getattr(args, 'tar_bounds', [])):
-            sess_name = args.session_names[idx]
-            if e <= s:
-                args.log.record(f"  Session {sess_name} skipped for TTA (no trials)")
-                continue
-            # build per-session tensors
-            ts = torch.from_numpy(X_tar[s:e]).float()
-            ys = torch.from_numpy(y_tar[s:e]).long()
+        # ─── run chunked adaptation...
+        avg_tta, avg_post = run_chunked_tta(base_network, X_tar, y_tar, args, idt_str, extra_string)
+        # save final adapted model
+        best_ckpt_adapted = f'./runs/{args.data_name}/{args.backbone}_S{idt_str}_seed{args.SEED}{extra_string}_adapted.ckpt'
+        torch.save(base_network.state_dict(), best_ckpt_adapted)
 
-            # repeat TTA up to 3 times on distinct batches of size max_tta
-            max_tta = 20
-            num_rounds = min(3, len(ts) // max_tta)
+        # after final adaptation, save Post-TTA probabilities
+        loader_post = DataLoader(
+            TensorDataset(torch.from_numpy(X_tar).float(),
+                          torch.from_numpy(y_tar).long()),
+            batch_size=1, shuffle=False
+        )
+        post_probs = []
+        base_network.eval()
+        for x_post, _ in loader_post:
+            # reshape to (1,1,chn,time) for EEGNet
+            x_in = x_post
+            if 'EEGNet' in args.backbone:
+                x_in = x_in.unsqueeze(3).permute(0,3,1,2)
+            with torch.no_grad():
+                _, out_post = base_network(x_in.to(args.device))
+                prob_post = nn.Softmax(dim=1)(out_post).cpu().numpy().squeeze()
+            post_probs.append(prob_post)
+        post_probs = np.stack(post_probs)
+        np.savetxt(
+            os.path.join(args.result_dir,
+                         f"{args.data_name}_T-TIME_seed_{args.SEED}_post_probs.csv"),
+            post_probs, delimiter=",",
+        )
 
-            # temp lists for this session
-            round_accs = []
-            round_test_accs = []
-            for r in range(num_rounds):
-                start = r * max_tta
-                end   = start + max_tta
-                ts_tta = ts[start:end]
-                ys_tta = ys[start:end]
-                # the “remaining” are everything before+after this chunk
-                ts_rem = torch.cat([ts[:start], ts[end:]], dim=0)
-                ys_rem = torch.cat([ys[:start], ys[end:]], dim=0)
-                if 'EEGNet' in args.backbone:
-                    ts_tta = ts_tta.unsqueeze(3).permute(0, 3, 1, 2)
-                    ts_rem = ts_rem.unsqueeze(3).permute(0, 3, 1, 2)
-                if args.data_env != 'local':
-                    ts_tta, ys_tta = ts_tta.cuda(), ys_tta.cuda()
-                    ts_rem, ys_rem = ts_rem.cuda(), ys_rem.cuda()
+        # ─── dump per-seed predictions ─────────────────────────────────────────
+        loader_all = DataLoader(
+            TensorDataset(torch.from_numpy(X_tar).float(),
+                          torch.from_numpy(y_tar).long()),
+            batch_size=1, shuffle=False
+        )
+        _, y_pred_full, _ = TTIME(loader_all, base_network,
+                                  args=args, balanced=args.balanced)
+        # For CustomEpoch, output predictions one row per session.
+        # write per-session predictions to CSV (handles varying lengths)
+        out_path = os.path.join(args.result_dir,
+                                f"{args.data_name}_T-TIME_seed_{args.SEED}_pred.csv")
+        with open(out_path, 'w') as fw:
+            if args.data_name == 'CustomEpoch':
+                for start, end in args.tar_bounds:
+                    row = y_pred_full[start:end]
+                    fw.write(','.join(map(str, row.tolist())) + '\n')
+            else:
+                fw.write(','.join(map(str, y_pred_full.tolist())) + '\n')
+        return avg_tta, pre_score, avg_post
 
-                # run TTA on this chunk
-                loader_tta = DataLoader(TensorDataset(ts_tta, ys_tta), batch_size=1, shuffle=False)
-                acc_tta, _, sqrtRefEA = TTIME(loader_tta, base_network, args=args, balanced=args.balanced)
-                args.log.record(f"  Round {r+1} TTA Acc = {acc_tta:.2f}%")
-                print(f"  Round {r+1} TTA Acc = {acc_tta:.2f}%")
 
-                # test on the remaining trials
-                if args.align and len(ts_rem) > 0:
-                    # align the remaining trials with latest EA matrix
-                    rem_np = ts_rem.squeeze(1).cpu().numpy()   # (n_rem, chn, time)
-                    rem_aligned = np.einsum('ij,njt->nit', sqrtRefEA, rem_np)
-                    ts_rem = torch.from_numpy(rem_aligned).unsqueeze(1).to(ts_rem.dtype)
-                    if args.data_env != 'local':
-                        ts_rem = ts_rem.cuda()
-                loader_rem = DataLoader(TensorDataset(ts_rem, ys_rem), batch_size=1, shuffle=False)
-
-                if args.balanced:
-                    acc_rem, _ = cal_acc_comb(loader_rem, base_network, args=args)
-                else:
-                    acc_rem = cal_score_online(loader_rem, base_network, args=args)
-                args.log.record(f"  Round {r+1} post-TTA test Acc = {acc_rem:.2f}%")
-                print(f"  Round {r+1} post-TTA test Acc = {acc_rem:.2f}%")
-                round_accs.append(acc_tta)
-                round_test_accs.append(acc_rem)
-            # average over rounds for this session
-            if round_accs:
-                sess_accs.append(float(np.mean(round_accs)))
-                sess_test_accs.append(float(np.mean(round_test_accs)))
-        # overall average across sessions
-        acc_t_te = float(np.mean(sess_accs)) if sess_accs else 0.0
-        acc_test = float(np.mean(sess_test_accs)) if sess_test_accs else 0.0
-        log_str = f"Task: {args.task_str}, Overall TTA {'Acc' if args.balanced else 'AUC'} = {acc_t_te:.2f}%"
-        args.log.record(log_str)
-        print(log_str)
-        args.log.record(f"Task: {args.task_str}, Overall post-TTA test {'Acc' if args.balanced else 'AUC'} = {acc_test:.2f}%")
-        print(f"Overall post-TTA test {'Acc' if args.balanced else 'AUC'} = {acc_test:.2f}%")
-
-        # Save the adapted model using the corrected id string
-        torch.save(base_network.state_dict(), './runs/' + str(args.data_name) + '/' +
-                   str(args.backbone) + '_S' + idt_str + '_seed' + str(args.SEED) +
-                   extra_string + '_adapted' + '.ckpt')
-
-        gc.collect()
+# ─── Helper: run chunked TTA per session ──────────────────────────────────────
+def run_chunked_tta(base_network, X_tar, y_tar, args, idt_str, extra_string):
+    print('Executing per-session TTA with chunked batches...')
+    sess_tta_accs, sess_post_accs = [], []
+    for idx, (s, e) in enumerate(getattr(args, 'tar_bounds', [])):
+        sess_name = args.session_names[idx]
+        ts = torch.from_numpy(X_tar[s:e]).float()
+        ys = torch.from_numpy(y_tar[s:e]).long()
+        if 'EEGNet' in args.backbone:
+            ts = ts.unsqueeze(3).permute(0,3,1,2)
         if args.data_env != 'local':
-            torch.cuda.empty_cache()
+            ts, ys = ts.cuda(), ys.cuda()
+        max_tta = getattr(args, 'max_tta', 20)
+        num_rounds = min(3, len(ts) // max_tta)
+        round_tta, round_post = [], []
+        for r in range(num_rounds):
+            start, end = r * max_tta, (r + 1) * max_tta
+            loader_tta = prepare_loader(ts[start:end], ys[start:end], batch_size=1)
 
-        return acc_t_te, pre_score, acc_test
+            # get TTA accuracy and per-trial probabilities
+            acc_tta, y_pred_tta, sqrtRefEA = TTIME(loader_tta, base_network, args=args, balanced=args.balanced)
+            # ensure 2D probs array
+            if y_pred_tta.ndim == 1:
+                probs2d = np.stack([1 - y_pred_tta, y_pred_tta], axis=1)
+            else:
+                probs2d = y_pred_tta
+            preds_tta = np.argmax(probs2d, axis=1)
+            true_tta = ys[start:end].cpu().numpy()
+            # print each trial as "[idx: class1_prob : class0_prob, true, pred]"
+            if args.print_trial_details:
+                for j, (p0, p1, t, pr) in enumerate(zip(probs2d[:,0], probs2d[:,1], true_tta, preds_tta)):
+                    print(f"[{start+j}: {p1:.4f} : {p0:.4f}, {t}, {pr}]")
+                    args.log.record(f"[{start+j}: {p1:.4f} : {p0:.4f}, {t}, {pr}]")
+
+            # align full test set with latest EA matrix
+            aligned_ts = ts.squeeze(1).cpu().numpy()
+            aligned = np.einsum('ij,njt->nit', sqrtRefEA, aligned_ts)
+            ts_al = torch.from_numpy(aligned).unsqueeze(1).to(ts.dtype)
+            if args.data_env != 'local':
+                ts_al = ts_al.cuda()
+            loader_post = prepare_loader(ts_al, ys, batch_size=1)
+
+            # compute Post-TTA per-trial probabilities and accuracy
+            probs_post = []; labels_post = []
+            for x_post, y_post in loader_post:
+                x_in = x_post.to(args.device)
+                base_network.eval()
+                with torch.no_grad():
+                    _, out_post = base_network(x_in)
+                    prob_post = nn.Softmax(dim=1)(out_post).detach().cpu().numpy()
+                probs_post.append(prob_post)
+                labels_post.append(y_post.item())
+            probs_post_arr = np.vstack(probs_post)
+            if args.balanced:
+                preds_post = np.argmax(probs_post_arr, axis=1)
+                post_acc = accuracy_score(labels_post, preds_post) * 100
+            else:
+                post_acc = roc_auc_score(labels_post, probs_post_arr[:,1]) * 100
+            labels_post_arr = np.array(labels_post)
+            preds_post = np.argmax(probs_post_arr, axis=1)
+            combined_post = np.stack([labels_post_arr, preds_post], axis=1)
+            # print each post-TTA trial
+            if args.print_trial_details:
+                for j, (p0, p1, t, pr) in enumerate(zip(probs_post_arr[:,0], probs_post_arr[:,1], labels_post_arr, preds_post)):
+                    print(f"[{start+j}: {p1:.4f} : {p0:.4f}, {t}, {pr}]")
+                    args.log.record(f"[{start+j}: {p1:.4f} : {p0:.4f}, {t}, {pr}]")
+
+            print(f"  Session {sess_name} Round {r+1} TTA = {acc_tta:.2f}%, Post-TTA = {post_acc:.2f}%")
+            args.log.record(f"  Session {sess_name} Round {r+1} TTA = {acc_tta:.2f}%, Post-TTA = {post_acc:.2f}%")
+            # save this round’s adapted model
+            torch.save(
+                base_network.state_dict(),
+                f'./runs/{args.data_name}/{args.backbone}_S{idt_str}_seed{args.SEED}{extra_string}_adapted_r{r+1}.ckpt'
+            )
+            round_tta.append(acc_tta); round_post.append(post_acc)
+        sess_acc = float(np.mean(round_tta)) if round_tta else 0.0
+        sess_post = float(np.mean(round_post)) if round_post else 0.0
+        print(f"Session {sess_name} Avg TTA = {sess_acc:.2f}%, Avg Post-TTA = {sess_post:.2f}%")
+        args.log.record(f"Session {sess_name} Avg TTA = {sess_acc:.2f}%, Avg Post-TTA = {sess_post:.2f}%")
+        sess_tta_accs.append(sess_acc); sess_post_accs.append(sess_post)
+    avg_tta = float(np.mean(sess_tta_accs)) if sess_tta_accs else 0.0
+    avg_post = float(np.mean(sess_post_accs)) if sess_post_accs else 0.0
+    print(f"Overall Avg TTA = {avg_tta:.2f}%, Overall Avg Post-TTA = {avg_post:.2f}%")
+    args.log.record(f"Overall Avg TTA = {avg_tta:.2f}%, Overall Avg Post-TTA = {avg_post:.2f}%")
+    print('Subject per-session TTA Accuracies:', np.round(sess_tta_accs,3))
+    args.log.record(f"Subject per-session TTA Accuracies: {np.round(sess_tta_accs,3)}")
+    print('Subject per-session Post-TTA Accuracies:', np.round(sess_post_accs,3))
+    args.log.record(f"Subject per-session Post-TTA Accuracies: {np.round(sess_post_accs,3)}")
+    return avg_tta, avg_post
 
 
 if __name__ == '__main__':
@@ -508,6 +647,8 @@ if __name__ == '__main__':
                                   trial_num=trial_num, time_sample_num=time_sample_num, sample_rate=sample_rate,
                                   N=N, chn=chn, class_num=class_num, stride=stride, steps=steps, calc_time=calc_time,
                                   paradigm=paradigm, test_batch=test_batch, data_name=data_name, balanced=balanced)
+        # control trial-level detail printing
+        args.print_trial_details = False
 
         args.method = 'T-TIME'
         args.backbone = 'EEGNet'
@@ -520,95 +661,364 @@ if __name__ == '__main__':
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         args.device = device
         args.data_env = 'gpu' if torch.cuda.is_available() else 'local'
-        total_acc = []
+        
+        # Make sure args.data is set correctly before initializing logging
+        args.data = data_name
+        
+        # Initialize logging before starting subject processing
+        args.local_dir = './data/' + str(data_name) + '/'
+        args.result_dir = './logs/'
+        my_log = LogRecord(args)
+        my_log.log_init()
+        my_log.record('=' * 50 + '\n' + os.path.basename(__file__) + '\n' + '=' * 50)
+        args.log = my_log
+        
+        # Initialize storage for results
+        seeds = [2, 3, 5, 6, 7, 8, 9, 10, 11, 42]
+        total_acc = np.zeros((len(seeds), N))
+        pre_acc_all_seeds = np.zeros((len(seeds), N))
+        post_acc_all_seeds = np.zeros((len(seeds), N))
+        # collect ensemble accuracies per subject
+        ensemble_tta_all = []
+        ensemble_pre_all = []
+        ensemble_post_all = []
 
-        # update multiple models, independently, from the source models
-        for s in [2,3,4,5,6,7,8,9,10]:
-            args.SEED = s
+        # Iterate through each subject first
+        for idt in range(N):
+            # collect all session indices belonging to this subject prefix
+            target_str = subject_names[idt]
+            idts = [i for i, fn in enumerate(files) if fn.split('_')[0] == target_str]
+            args.idt = idts
+            
+            # use prefix names
+            others = subject_names.copy()
+            others.pop(idt)
+            source_str = 'Except_' + '_'.join(others)
+            args.task_str = source_str + '_2_' + target_str
+            
+            info_str = '\n========================== Transfer to ' + target_str + ' =========================='
+            print(info_str)
+            args.log.record(info_str)
+            
+            # Now run all seeds for this subject
+            for seed_idx, s in enumerate(seeds):
+                args.SEED = s
+                print(f"\n--- Running Subject {target_str} with Seed {s} ---")
+                args.log.record(f"\n--- Running Subject {target_str} with Seed {s} ---")
 
-            fix_random_seed(args.SEED)
-            torch.backends.cudnn.deterministic = True
+                fix_random_seed(args.SEED)
+                torch.backends.cudnn.deterministic = True
 
-            args.data = data_name
-            print(args.data)
-            print(args.method)
-            print(args.SEED)
-            print(args)
+                args.data = data_name
+                print(f"Data: {args.data}, Method: {args.method}, Seed: {args.SEED}")
+                args.log.record(f"Data: {args.data}, Method: {args.method}, Seed: {args.SEED}")
 
-            args.local_dir = './data/' + str(data_name) + '/'
-            args.result_dir = './logs/'
-            my_log = LogRecord(args)
-            my_log.log_init()
-            my_log.record('=' * 50 + '\n' + os.path.basename(__file__) + '\n' + '=' * 50)
-            args.log = my_log
-
-            # log device usage
-            print(f"Using device: {args.device}")
-            args.log.record(f"Using device: {args.device}")
-
-            sub_acc_all = np.zeros(N)
-            pre_acc_all = np.zeros(N)
-            post_acc_all = np.zeros(N)
-
-            for idt in range(N):
-                # collect all session indices belonging to this subject prefix
-                target_str = subject_names[idt]
-                idts = [i for i, fn in enumerate(files) if fn.split('_')[0] == target_str]
-                args.idt = idts
-                # use prefix names
-                others = subject_names.copy()
-                others.pop(idt)
-                source_str = 'Except_' + '_'.join(others)
-                args.task_str = source_str + '_2_' + target_str
-                info_str = '\n========================== Transfer to ' + target_str + ' =========================='
-                print(info_str)
-                my_log.record(info_str)
-
+                # Run training and evaluation for this subject and seed
                 tta_acc, pre_acc, post_acc = train_target(args)
-                sub_acc_all[idt] = tta_acc
-                pre_acc_all[idt] = pre_acc
-                post_acc_all[idt] = post_acc
+                
+                # Store results
+                total_acc[seed_idx, idt] = tta_acc
+                pre_acc_all_seeds[seed_idx, idt] = pre_acc
+                post_acc_all_seeds[seed_idx, idt] = post_acc
+                
+                # Log results for this subject and seed
+                print(f"Subject {target_str} with Seed {s} - TTA Acc: {tta_acc:.3f}, Pre-TTA: {pre_acc:.3f}, Post-TTA: {post_acc:.3f}")
+                args.log.record(f"Subject {target_str} with Seed {s} - TTA Acc: {tta_acc:.3f}, Pre-TTA: {pre_acc:.3f}, Post-TTA: {post_acc:.3f}")
+                
+                # Save per-seed, per-subject results
+                np.savetxt(
+                    os.path.join(args.result_dir, f"{data_name}_T-TIME_seed_{args.SEED}_subject_{idt}_acc.csv"),
+                    np.array([tta_acc, pre_acc, post_acc]), delimiter=","
+                )
+                
+                # Clear GPU memory between seeds
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
+            # After all seeds for this subject, print summary for this subject
+            subject_mean_tta = np.mean(total_acc[:, idt])
+            subject_std_tta = np.std(total_acc[:, idt])
+            subject_mean_pre = np.mean(pre_acc_all_seeds[:, idt])
+            subject_std_pre = np.std(pre_acc_all_seeds[:, idt])
+            subject_mean_post = np.mean(post_acc_all_seeds[:, idt])
+            subject_std_post = np.std(post_acc_all_seeds[:, idt])
+            
+            # Calculate 95% confidence intervals (for small sample sizes using t-distribution)
+            from scipy import stats
+            n_seeds = len(seeds)
+            confidence = 0.95
+            # t-value for 95% confidence with n-1 degrees of freedom
+            t_val = stats.t.ppf((1 + confidence) / 2, n_seeds - 1)
+            ci_tta = t_val * (subject_std_tta / np.sqrt(n_seeds))
+            ci_pre = t_val * (subject_std_pre / np.sqrt(n_seeds))
+            ci_post = t_val * (subject_std_post / np.sqrt(n_seeds))
+            
+            print(f"\n=== Subject {target_str} Summary Across All Seeds ===")
+            print(f"TTA Accuracy: {subject_mean_tta:.3f} ± {subject_std_tta:.3f} (95% CI: {subject_mean_tta-ci_tta:.3f} to {subject_mean_tta+ci_tta:.3f})")
+            print(f"Pre-TTA Accuracy: {subject_mean_pre:.3f} ± {subject_std_pre:.3f} (95% CI: {subject_mean_pre-ci_pre:.3f} to {subject_mean_pre+ci_pre:.3f})")
+            print(f"Post-TTA Accuracy: {subject_mean_post:.3f} ± {subject_std_post:.3f} (95% CI: {subject_mean_post-ci_post:.3f} to {subject_mean_post+ci_post:.3f})")
+            args.log.record(f"\n=== Subject {target_str} Summary Across All Seeds ===")
+            args.log.record(f"TTA Accuracy: {subject_mean_tta:.3f} ± {subject_std_tta:.3f} (95% CI: {subject_mean_tta-ci_tta:.3f} to {subject_mean_tta+ci_tta:.3f})")
+            args.log.record(f"Pre-TTA Accuracy: {subject_mean_pre:.3f} ± {subject_std_pre:.3f} (95% CI: {subject_mean_pre-ci_pre:.3f} to {subject_mean_pre+ci_pre:.3f})")
+            args.log.record(f"Post-TTA Accuracy: {subject_mean_post:.3f} ± {subject_std_post:.3f} (95% CI: {subject_mean_post-ci_post:.3f} to {subject_mean_post+ci_post:.3f})")
 
-            print('Subject TTA Accuracy for each session: ', np.round(sub_acc_all, 3))
-            print('Average TTA Accuracy: ', np.round(np.mean(sub_acc_all), 3))
-            print('Subject Pre-TTA IEA Accuracy for each session: ', np.round(pre_acc_all, 3))
-            print('Average Pre-TTA IEA Accuracy: ', np.round(np.mean(pre_acc_all), 3))
-            print('Subject Post-TTA Test AUC for each session: ', np.round(post_acc_all, 3))
-            print('Average Post-TTA Test AUC: ', np.round(np.mean(post_acc_all), 3))
-            # also print accuracy
-            print('Average Post-TTA Test Accuracy: ', np.round(np.mean(post_acc_all), 3))
+            # Ensemble evaluation across seeds for this subject
+            # reload target labels for this subject
+            X_src, y_src, X_tar_sub, y_tar_sub = read_mi_combine_tar(args)
 
-            total_acc.append(sub_acc_all)
+            preds_seeds = []
+            for s in seeds:
+                pred_file = os.path.join(args.result_dir,
+                    f"{args.data_name}_T-TIME_seed_{s}_pred.csv")
+                # load ragged CSV: read each line and extend
+                flat = []
+                with open(pred_file, 'r') as fr:
+                    for line in fr:
+                        parts = line.strip().split(',')
+                        flat.extend([float(x) for x in parts if x])
+                preds_seeds.append(np.array(flat))
+            preds_arr = np.stack(preds_seeds, axis=0)  # now shape (n_seeds, n_trials)
 
-            acc_sub_str = str(np.round(sub_acc_all, 3).tolist())
-            acc_mean_str = str(np.round(np.mean(sub_acc_all), 3).tolist())
-            args.log.record("\n==========================================")
-            args.log.record(acc_sub_str)
-            args.log.record(acc_mean_str)
+            # ─── Session‐level TTA ensembles & averaged summary ─────────────────
+            session_accs = [[], [], [], []]  # maj, mean, med, sml
+            print(f"\nSession-level TTA ensembles for subject {target_str}:")
+            args.log.record(f"Session-level TTA ensembles for subject {target_str}:")
+            for idx, (start, end) in enumerate(args.tar_bounds):
+                true_s = y_tar_sub[start:end]
+                sess_mat = preds_arr[:, start:end]
+                # 1) Majority on hard labels
+                labels_s = (sess_mat > 0.5).astype(int)
+                maj_s = (labels_s.sum(axis=0) >= len(seeds)/2).astype(int)
+                maj_acc = accuracy_score(true_s, maj_s) * 100
+                # 2) MeanProb with session Youden’s J
+                mean_probs = sess_mat.mean(axis=0)
+                fpr, tpr, ths = roc_curve(true_s, mean_probs)
+                best_t = ths[np.argmax(tpr - fpr)]
+                mean_s = (mean_probs > best_t).astype(int)
+                mean_acc = accuracy_score(true_s, mean_s) * 100
+                # 3) MedianProb with session Youden’s J
+                med_probs = np.median(sess_mat, axis=0)
+                fpr2, tpr2, ths2 = roc_curve(true_s, med_probs)
+                best_t2 = ths2[np.argmax(tpr2 - fpr2)]
+                med_s = (med_probs > best_t2).astype(int)
+                med_acc = accuracy_score(true_s, med_s) * 100
+                # 4) SML on hard labels
+                sml_s = SML(labels_s)
+                sml_acc = accuracy_score(true_s, sml_s) * 100
 
-        args.log.record('\n' + '#' * 20 + 'final results' + '#' * 20)
+                # collect
+                for lst, v in zip(session_accs, (maj_acc, mean_acc, med_acc, sml_acc)):
+                    lst.append(v)
 
-        print(str(total_acc))
+                line = (f" Session {idx+1}: Majority={maj_acc:.2f}%, "
+                        f"MeanProb={mean_acc:.2f}%, MedianProb={med_acc:.2f}%, SML={sml_acc:.2f}%")
+                print(line); args.log.record(line)
 
-        args.log.record(str(total_acc))
+            # averaged across sessions
+            avg_maj, avg_mean, avg_med, avg_sml = [np.mean(lst) for lst in session_accs]
+            print(f"\nEnsemble TTA (avg of sessions): Majority={avg_maj:.2f}%, "
+                  f"MeanProb={avg_mean:.2f}%, MedianProb={avg_med:.2f}%, SML={avg_sml:.2f}%")
+            args.log.record(f"Ensemble TTA (avg of sessions): Majority={avg_maj:.2f}%, "
+                            f"MeanProb={avg_mean:.2f}%, MedianProb={avg_med:.2f}%, SML={avg_sml:.2f}%")
 
-        subject_mean = np.round(np.average(total_acc, axis=0), 5)
-        total_mean = np.round(np.average(np.average(total_acc)), 5)
-        total_std = np.round(np.std(np.average(total_acc, axis=1)), 5)
+  
+            pre_list = []
+            for s in seeds:
+                pp = np.loadtxt(os.path.join(args.result_dir,
+                    f"{args.data_name}_T-TIME_seed_{s}_pre_probs.csv"), delimiter=',')
+                prob1 = pp[:,1] if pp.ndim>1 else pp
+                pre_list.append(prob1)
+            pre_mat = np.stack(pre_list, axis=0)  # shape (n_seeds, n_trials)
+            pre_labels = (pre_mat > 0.5).astype(int)
+            # majority
+            pre_maj = (pre_labels.sum(axis=0) >= (len(seeds)/2)).astype(int)
+            # mean & median decisions
+            pre_mean_vote = (pre_mat.mean(axis=0) > 0.5).astype(int)
+            pre_med_vote  = (np.median(pre_mat, axis=0) > 0.5).astype(int)
+            # SML on hard labels
+            pre_sml = SML(pre_labels)
+            # accuracies
+            acc_pre_maj  = accuracy_score(y_tar_sub, pre_maj) * 100
+            acc_pre_mean = accuracy_score(y_tar_sub, pre_mean_vote) * 100
+            acc_pre_med  = accuracy_score(y_tar_sub, pre_med_vote) * 100
+            acc_pre_sml  = accuracy_score(y_tar_sub, pre_sml) * 100
+            # ─── Session-average Pre-TTA ─────────────────────────────────────────
+            session_pre = [[], [], [], []]  # maj, mean, med, sml
+            for idx, (s, e) in enumerate(args.tar_bounds):
+                y_true_s = y_tar_sub[s:e]
+                mat = pre_mat[:, s:e]
+                # majority
+                maj = ((mat > 0.5).sum(axis=0) >= len(seeds)/2).astype(int)
+                session_pre[0].append(accuracy_score(y_true_s, maj)*100)
+                # mean + Youden
+                mp = mat.mean(axis=0)
+                fpr, tpr, ths = roc_curve(y_true_s, mp)
+                thr = ths[np.argmax(tpr-fpr)]
+                session_pre[1].append(accuracy_score(y_true_s,(mp>thr).astype(int))*100)
+                # median + Youden
+                md = np.median(mat,axis=0)
+                fpr2, tpr2, ths2 = roc_curve(y_true_s, md)
+                thr2 = ths2[np.argmax(tpr2-fpr2)]
+                session_pre[2].append(accuracy_score(y_true_s,(md>thr2).astype(int))*100)
+                # SML
+                session_pre[3].append(accuracy_score(y_true_s,SML((mat>0.5).astype(int)))*100)
+            avg_pre = [np.mean(lst) for lst in session_pre]
+            print(f"\nEnsemble Pre-TTA (avg of sessions): Majority={avg_pre[0]:.2f}%, MeanProb={avg_pre[1]:.2f}%, MedianProb={avg_pre[2]:.2f}%, SML={avg_pre[3]:.2f}%")
+            args.log.record(f"Ensemble Pre-TTA (avg of sessions): Majority={avg_pre[0]:.2f}%, MeanProb={avg_pre[1]:.2f}%, MedianProb={avg_pre[2]:.2f}%, SML={avg_pre[3]:.2f}%")
 
-        print(subject_mean)
-        print(total_mean)
-        print(total_std)
+            # ─── Session-level Pre-TTA ensembles ─────────────────────────
+            print(f"\nSession-level Pre-TTA ensembles for subject {target_str}:")
+            args.log.record(f"Session-level Pre-TTA ensembles for subject {target_str}:")
+            for idx, (start, end) in enumerate(args.tar_bounds):
+                y_true_s = y_tar_sub[start:end]
+                sess_mat = pre_mat[:, start:end]
+                # per-session majority
+                maj_s = (sess_mat > 0.5).sum(axis=0) >= (len(seeds)/2)
+                # per-session mean + Youden’s J threshold
+                mean_probs = sess_mat.mean(axis=0)
+                fpr, tpr, ths = roc_curve(y_true_s, mean_probs)
+                best_t = ths[np.argmax(tpr - fpr)]
+                mean_s = mean_probs > best_t
+                # per-session median + Youden’s J
+                med_probs = np.median(sess_mat, axis=0)
+                fpr2, tpr2, ths2 = roc_curve(y_true_s, med_probs)
+                best_t2 = ths2[np.argmax(tpr2 - fpr2)]
+                med_s = med_probs > best_t2
+                # per-session SML on hard labels
+                sml_s = SML((sess_mat > 0.5).astype(int))
+                accs = (
+                    accuracy_score(y_true_s, maj_s) * 100,
+                    accuracy_score(y_true_s, mean_s) * 100,
+                    accuracy_score(y_true_s, med_s) * 100,
+                    accuracy_score(y_true_s, sml_s) * 100
+                )
+                line = (f" Session {idx+1}: Majority={accs[0]:.2f}%, MeanProb={accs[1]:.2f}%, "
+                        f"MedianProb={accs[2]:.2f}%, SML={accs[3]:.2f}%")
+                print(line); args.log.record(line)
 
-        args.log.record(str(subject_mean))
-        args.log.record(str(total_mean))
-        args.log.record(str(total_std))
+            # Ensemble summary for Post-TTA probabilities across seeds
+            # load per-trial post-TTA probs and stack
+            post_list = []
+            for s in seeds:
+                pp = np.loadtxt(os.path.join(args.result_dir,
+                    f"{args.data_name}_T-TIME_seed_{s}_post_probs.csv"), delimiter=',')
+                prob1 = pp[:,1] if pp.ndim>1 else pp
+                post_list.append(prob1)
+            post_mat = np.stack(post_list, axis=0)
+            post_labels = (post_mat > 0.5).astype(int)
+            post_maj = (post_labels.sum(axis=0) >= (len(seeds)/2)).astype(int)
+            post_mean_vote = (post_mat.mean(axis=0) > 0.5).astype(int)
+            post_med_vote  = (np.median(post_mat, axis=0) > 0.5).astype(int)
+            post_sml = SML(post_labels)
+            acc_post_maj  = accuracy_score(y_tar_sub, post_maj) * 100
+            acc_post_mean = accuracy_score(y_tar_sub, post_mean_vote) * 100
+            acc_post_med  = accuracy_score(y_tar_sub, post_med_vote) * 100
+            acc_post_sml  = accuracy_score(y_tar_sub, post_sml) * 100
+            # ─── Session-average Post-TTA ──────────────────────────────────────
+            session_post = [[], [], [], []]
+            for idx, (s, e) in enumerate(args.tar_bounds):
+                y_true_s = y_tar_sub[s:e]
+                mat = post_mat[:, s:e]
+                session_post[0].append(accuracy_score(y_true_s, ((mat>0.5).sum(axis=0)>=len(seeds)/2).astype(int))*100)
+                mp = mat.mean(axis=0)
+                fpr3, tpr3, ths3 = roc_curve(y_true_s, mp)
+                thr3 = ths3[np.argmax(tpr3-fpr3)]
+                session_post[1].append(accuracy_score(y_true_s,(mp>thr3).astype(int))*100)
+                md = np.median(mat,axis=0)
+                fpr4, tpr4, ths4 = roc_curve(y_true_s, md)
+                thr4 = ths4[np.argmax(tpr4-fpr4)]
+                session_post[2].append(accuracy_score(y_true_s,(md>thr4).astype(int))*100)
+                session_post[3].append(accuracy_score(y_true_s,SML((mat>0.5).astype(int)))*100)
+            avg_post = [np.mean(lst) for lst in session_post]
+            print(f"\nEnsemble Post-TTA (avg of sessions): Majority={avg_post[0]:.2f}%, MeanProb={avg_post[1]:.2f}%, MedianProb={avg_post[2]:.2f}%, SML={avg_post[3]:.2f}%")
+            args.log.record(f"Ensemble Post-TTA (avg of sessions): Majority={avg_post[0]:.2f}%, MeanProb={avg_post[1]:.2f}%, MedianProb={avg_post[2]:.2f}%, SML={avg_post[3]:.2f}%")
 
-        # build result_dct for this dataset
-        result_dct = {'dataset': data_name, 'avg': total_mean, 'std': total_std}
-        for i, v in enumerate(subject_mean):
-            result_dct[f's{i}'] = v
+            # ─── Session-level Post-TTA ensembles ────────────────────────────
+            print(f"\nSession-level Post-TTA ensembles for subject {target_str}:")
+            args.log.record(f"Session-level Post-TTA ensembles for subject {target_str}:")
+            for idx, (start, end) in enumerate(args.tar_bounds):
+                y_true_s = y_tar_sub[start:end]
+                sess_mat = post_mat[:, start:end]
+                maj_s   = (sess_mat > 0.5).sum(axis=0) >= (len(seeds)/2)
+                mean_probs = sess_mat.mean(axis=0)
+                fpr3, tpr3, ths3 = roc_curve(y_true_s, mean_probs)
+                best_t3 = ths3[np.argmax(tpr3 - fpr3)]
+                mean_s = mean_probs > best_t3
+                med_probs = np.median(sess_mat, axis=0)
+                fpr4, tpr4, ths4 = roc_curve(y_true_s, med_probs)
+                best_t4 = ths4[np.argmax(tpr4 - fpr4)]
+                med_s = med_probs > best_t4
+                sml_s = SML((sess_mat > 0.5).astype(int))
+                accs = (
+                    accuracy_score(y_true_s, maj_s) * 100,
+                    accuracy_score(y_true_s, mean_s) * 100,
+                    accuracy_score(y_true_s, med_s) * 100,
+                    accuracy_score(y_true_s, sml_s) * 100
+                )
+                line = (f" Session {idx+1}: Majority={accs[0]:.2f}%, MeanProb={accs[1]:.2f}%, "
+                        f"MedianProb={accs[2]:.2f}%, SML={accs[3]:.2f}%")
+                print(line); args.log.record(line)
 
-        dct = pd.concat([dct, pd.DataFrame([result_dct])], ignore_index=True)
+        # ─── Final summary across all subjects ───────────────────────────────
+        print("=== Per-seed × per-subject Accuracies ===")
+        header = "Subjects: " + ", ".join(subject_names)
+        print(header); args.log.record(header)
+        seed_line = "Seeds: " + ", ".join(map(str, seeds))
+        print(seed_line); args.log.record(seed_line)
 
-    dct.to_csv('./logs/' + str(args.method) + ".csv")
+        # TTA matrix
+        print("TTA Accs (rows=seeds, cols=subjects):")
+        print(np.round(total_acc, 3))
+        args.log.record("TTA Accs:\n" + np.array2string(np.round(total_acc, 3)))
+
+        # Pre-TTA matrix
+        print("Pre-TTA Accs (rows=seeds, cols=subjects):")
+        print(np.round(pre_acc_all_seeds, 3))
+        args.log.record("Pre-TTA Accs:\n" + np.array2string(np.round(pre_acc_all_seeds, 3)))
+
+        # Post-TTA matrix
+        print("Post-TTA Accs (rows=seeds, cols=subjects):")
+        print(np.round(post_acc_all_seeds, 3))
+        args.log.record("Post-TTA Accs:\n" + np.array2string(np.round(post_acc_all_seeds, 3)))
+
+        # Per-seed means
+        tta_seed_mean  = np.round(np.mean(total_acc, axis=1), 3)
+        pre_seed_mean  = np.round(np.mean(pre_acc_all_seeds, axis=1), 3)
+        post_seed_mean = np.round(np.mean(post_acc_all_seeds, axis=1), 3)
+        print("Overall per-seed means:")
+        print("  TTA:    ", tta_seed_mean)
+        print("  Pre-TTA:", pre_seed_mean)
+        print("  Post-TTA:", post_seed_mean)
+        args.log.record(f"Overall per-seed TTA mean:  {tta_seed_mean}")
+        args.log.record(f"Overall per-seed Pre-TTA mean:  {pre_seed_mean}")
+        args.log.record(f"Overall per-seed Post-TTA mean: {post_seed_mean}")
+
+        # Grand means
+        overall_tta  = np.mean(total_acc)
+        overall_pre  = np.mean(pre_acc_all_seeds)
+        overall_post = np.mean(post_acc_all_seeds)
+        summary = (
+            f"Grand Means:\n"
+            f"  Overall TTA Acc:   {overall_tta:.2f}%\n"
+            f"  Overall Pre-TTA:    {overall_pre:.2f}%\n"
+            f"  Overall Post-TTA:  {overall_post:.2f}%"
+        )
+        print(summary)
+        args.log.record(summary)
+
+        # ─── Grand ensemble means across subjects ─────────────────────────
+        mt = np.array(ensemble_tta_all)
+        mp = np.array(ensemble_pre_all)
+        ms = np.array(ensemble_post_all)
+        gm = (
+            f"Grand Ensemble Means:\n"
+            f"  TTA    : Majority={mt[:,0].mean():.2f}%, MeanProb={mt[:,1].mean():.2f}%, "
+            f"Median={mt[:,2].mean():.2f}%, SML={mt[:,3].mean():.2f}%\n"
+            f"  Pre-TTA: Majority={mp[:,0].mean():.2f}%, MeanProb={mp[:,1].mean():.2f}%, "
+            f"Median={mp[:,2].mean():.2f}%, SML={mp[:,3].mean():.2f}%\n"
+            f"  Post-TTA: Majority={ms[:,0].mean():.2f}%, MeanProb={ms[:,1].mean():.2f}%, "
+            f"Median={ms[:,2].mean():.2f}%, SML={ms[:,3].mean():.2f}%"
+        )
+        print(gm)
+        args.log.record(gm)
+    # end of for data_name
