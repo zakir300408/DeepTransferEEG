@@ -524,284 +524,275 @@ if __name__ == '__main__':
         else:
             raise ValueError(f"Unknown data_name {data_name}")
 
-        # whether to use pretrained model
-        # if source models have not been trained, set use_pretrained_model to False to train them
-        # alternatively, run dnn.py to train source models, in seperating the steps
-        use_pretrained_model = False
-        if use_pretrained_model:
-            # no training
-            max_epoch = 0
-        else:
-            # training epochs
-            max_epoch = 30
+        # ── Define hyperparameter grid ─────────────────────────────────
+        max_tta_list = [6, 8, 10, 12, 16]
+        stride_list  = [1, 2, 3, 4]
+        t_list       = [1.3, 1.5, 1.7, 1.8, 1.9, 2.0, 2.2]
+        lr_list      = [0.0001, 0.0005, 0.001]
+        steps_list   = [1, 3, 5, 7, 9, 11]
 
-        # learning rate
-        lr = 0.0005
-
-        # max_tta: maximum sliding‐window size for TTA
-        max_tta = 20
-
-        # update step
-        steps = 5
-
-        # update stride
-        stride = 1
-
-
-        # whether to use EA
         align = True
 
-        # temperature rescaling, for test entropy calculation
-        t = 1.7
+        use_pretrained_model = True  # keep existing behavior
 
-        # whether to test balanced or imbalanced (2:1) target subject
-        balanced = True
+        # ── Hyperparameter search loops ───────────────────────────────
+        for max_tta in max_tta_list:
+            for stride in stride_list:
+                for t in t_list:
+                    for lr in lr_list:
+                        for steps in steps_list:
+                            # set training epochs
+                            max_epoch = 0 if use_pretrained_model else 30
+                            balanced   = True
+                            calc_time  = False
+                            # build args for this combination
+                            args = argparse.Namespace(
+                                feature_deep_dim=feature_deep_dim,
+                                align=align,
+                                lr=lr,
+                                t=t,
+                                max_epoch=max_epoch,
+                                trial_num=trial_num,
+                                time_sample_num=time_sample_num,
+                                sample_rate=sample_rate,
+                                N=N,
+                                chn=chn,
+                                class_num=class_num,
+                                stride=stride,
+                                steps=steps,
+                                calc_time=calc_time,
+                                paradigm=paradigm,
+                                max_tta=max_tta,
+                                data_name=data_name,
+                                balanced=balanced
+                            )
+                            args.print_trial_details = False
+                            args.method    = 'T-TIME'
+                            args.backbone  = 'EEGNet'
+                            args.batch_size= 128
+                            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                            args.device    = device
+                            args.data_env  = 'gpu' if torch.cuda.is_available() else 'local'
+                            args.data      = data_name
+                            args.local_dir = './data/' + str(data_name) + '/'
+                            # override result_dir per hyperparameter combo
+                            args.result_dir = (
+                                f'./logs/{data_name}/'
+                                f'mtta{max_tta}_str{stride}_t{t}_lr{lr}_st{steps}/'
+                            )
+                            os.makedirs(args.result_dir, exist_ok=True)
 
-        # whether to record running time
-        calc_time = False
+                            # create a dedicated log file for this hyper‐parameter run
+                            log_name = f"log_T-TIME_{data_name}_mtta{max_tta}_str{stride}_t{t}_lr{lr}_st{steps}.txt"
+                            log_path = os.path.join(args.result_dir, log_name)
+                            args.out_file = open(log_path, 'w', encoding='utf-8')
 
-        args = argparse.Namespace(
-            feature_deep_dim=feature_deep_dim,
-            align=align,
-            lr=lr,
-            t=t,
-            max_epoch=max_epoch,
-            trial_num=trial_num,
-            time_sample_num=time_sample_num,
-            sample_rate=sample_rate,
-            N=N,
-            chn=chn,
-            class_num=class_num,
-            stride=stride,
-            steps=steps,
-            calc_time=calc_time,
-            paradigm=paradigm,
-            max_tta=max_tta,
-            data_name=data_name,
-            balanced=balanced
-        )
-        # control trial-level detail printing
-        args.print_trial_details = False
+                            # ── existing initialization of logging, seeds, storage... ──
+                            my_log = LogRecord(args)
+                            my_log.log_init()
+                            args.log = my_log
+                            # ADD file handler to capture DEBUG timing into same log file
+                            file_handler = logging.FileHandler(args.out_file.name)
+                            file_handler.setLevel(logging.DEBUG)
+                            file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+                            logger.addHandler(file_handler)
 
-        args.method = 'T-TIME'
-        args.backbone = 'EEGNet'
+                            # log and record the hyperparameter combination
+                            combo_str = (
+                                f"Running hyperparameters: "
+                                f"max_tta={max_tta}, stride={stride}, t={t}, lr={lr}, steps={steps}"
+                            )
+                            logger.info(combo_str)
+                            args.log.record(combo_str)
 
-        # train batch size
-        args.batch_size = 128
+                            seeds = [2, 3, 5, 6,7,8,9,11,12]
+                            total_acc = np.zeros((len(seeds), N))
+                            pre_acc_all_seeds = np.zeros((len(seeds), N))
+                            ensemble_tta_all = []
+                            ensemble_pre_all = []
+                            session_tta_breakdowns = []   # store per‐subject session‐wise TTA breakdown
+                            session_pre_breakdowns = []   # store per‐subject session‐wise Pre‐TTA breakdown
 
-        # GPU device id
-        # detect device and default to GPU if available
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        args.device = device
-        args.data_env = 'gpu' if torch.cuda.is_available() else 'local'
-        
-        # Make sure args.data is set correctly before initializing logging
-        args.data = data_name
-        
-        # Initialize logging before starting subject processing
-        args.local_dir = './data/' + str(data_name) + '/'
-        args.result_dir = './logs/'
-        os.makedirs(args.result_dir, exist_ok=True)
-        my_log = LogRecord(args)
-        my_log.log_init()
-        my_log.record('=' * 50 + '\n' + os.path.basename(__file__) + '\n' + '=' * 50)
-        args.log = my_log
+                            # Iterate through each subject first
+                            for idt in range(N):
+                                # collect all session indices belonging to this subject prefix
+                                target_str = subject_names[idt]
+                                idts = [i for i, fn in enumerate(files) if fn.split('_')[0] == target_str]
+                                args.idt = idts
+                                # Pre-load and cache subject data once per subject iteration
+                                if not hasattr(args, 'mi_data_loaded'):
+                                    args.mi_data_loaded = read_mi_combine_tar(args)
+                                else:
+                                    # refresh cache for the changed subject idt
+                                    args.mi_data_loaded = read_mi_combine_tar(args)
+                                # use prefix names
+                                others = subject_names.copy()
+                                others.pop(idt)
+                                source_str = 'Except_' + '_'.join(others)
+                                args.task_str = source_str + '_2_' + target_str
+                                
+                                info_str = '\n========================== Transfer to ' + target_str + ' =========================='
+                                logger.info(info_str)
+                                args.log.record(info_str)
+                                
+                                # Now run all seeds for this subject
+                                for seed_idx, s in enumerate(seeds):
+                                    args.SEED = s
+                                    logger.info(f"--- Running Subject {target_str} with Seed {s} ---")
+                                    args.log.record(f"--- Running Subject {target_str} with Seed {s} ---")
 
-        # ADD file handler to capture DEBUG timing into same log file
-        file_handler = logging.FileHandler(args.out_file.name)
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-        logger.addHandler(file_handler)
+                                    fix_random_seed(args.SEED)
+                                    torch.backends.cudnn.deterministic = True
 
-        # Initialize storage for results
-        seeds = [2, 3, 5, 6,7,8,9,11,12]
-        total_acc = np.zeros((len(seeds), N))
-        pre_acc_all_seeds = np.zeros((len(seeds), N))
-        ensemble_tta_all = []
-        ensemble_pre_all = []
-        session_tta_breakdowns = []   # store per‐subject session‐wise TTA breakdown
-        session_pre_breakdowns = []   # store per‐subject session‐wise Pre‐TTA breakdown
+                                    args.data = data_name
+                                    logger.info(f"Data: {args.data}, Method: {args.method}, Seed: {args.SEED}")
+                                    args.log.record(f"Data: {args.data}, Method: {args.method}, Seed: {args.SEED}")
 
-        # Iterate through each subject first
-        for idt in range(N):
-            # collect all session indices belonging to this subject prefix
-            target_str = subject_names[idt]
-            idts = [i for i, fn in enumerate(files) if fn.split('_')[0] == target_str]
-            args.idt = idts
-            # Pre-load and cache subject data once per subject iteration
-            if not hasattr(args, 'mi_data_loaded'):
-                args.mi_data_loaded = read_mi_combine_tar(args)
-            else:
-                # refresh cache for the changed subject idt
-                args.mi_data_loaded = read_mi_combine_tar(args)
-            # use prefix names
-            others = subject_names.copy()
-            others.pop(idt)
-            source_str = 'Except_' + '_'.join(others)
-            args.task_str = source_str + '_2_' + target_str
-            
-            info_str = '\n========================== Transfer to ' + target_str + ' =========================='
-            logger.info(info_str)
-            args.log.record(info_str)
-            
-            # Now run all seeds for this subject
-            for seed_idx, s in enumerate(seeds):
-                args.SEED = s
-                logger.info(f"--- Running Subject {target_str} with Seed {s} ---")
-                args.log.record(f"--- Running Subject {target_str} with Seed {s} ---")
+                                    # Run training and evaluation for this subject and seed
+                                    tta_acc, pre_acc = train_target(args)
+                                    
+                                    # Store results
+                                    total_acc[seed_idx, idt] = tta_acc
+                                    pre_acc_all_seeds[seed_idx, idt] = pre_acc
 
-                fix_random_seed(args.SEED)
-                torch.backends.cudnn.deterministic = True
+                                    # Log results for this subject and seed
+                                    logger.info(f"Subject {target_str} with Seed {s} - TTA Acc: {tta_acc:.3f}, Pre-TTA: {pre_acc:.3f}")
+                                    args.log.record(f"Subject {target_str} with Seed {s} - TTA Acc: {tta_acc:.3f}, Pre-TTA: {pre_acc:.3f}")
+                                    
+                                    # Save per-seed, per-subject results
+                                    np.savetxt(
+                                        os.path.join(args.result_dir, f"{data_name}_T-TIME_seed_{args.SEED}_subject_{idt}_acc.csv"),
+                                        np.array([tta_acc, pre_acc]), delimiter=","
+                                    )
+                                    
+                                    # Clear GPU memory between seeds
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                
+                                # After all seeds for this subject, print summary for this subject
+                                subject_mean_tta = np.mean(total_acc[:, idt])
+                                subject_std_tta = np.std(total_acc[:, idt])
+                                subject_mean_pre = np.mean(pre_acc_all_seeds[:, idt])
+                                subject_std_pre = np.std(pre_acc_all_seeds[:, idt])
 
-                args.data = data_name
-                logger.info(f"Data: {args.data}, Method: {args.method}, Seed: {args.SEED}")
-                args.log.record(f"Data: {args.data}, Method: {args.method}, Seed: {args.SEED}")
+                                # Calculate 95% confidence intervals (for small sample sizes using t-distribution)
+                                from scipy import stats
+                                n_seeds = len(seeds)
+                                confidence = 0.95
+                                # t-value for 95% confidence with n-1 degrees of freedom
+                                t_val = stats.t.ppf((1 + confidence) / 2, n_seeds - 1)
+                                ci_tta = t_val * (subject_std_tta / np.sqrt(n_seeds))
+                                ci_pre = t_val * (subject_std_pre / np.sqrt(n_seeds))
+                                
+                                logger.info(f"=== Subject {target_str} Summary Across All Seeds ===")
+                                logger.info(f"TTA Accuracy: {subject_mean_tta:.3f} ± {subject_std_tta:.3f} (95% CI: {subject_mean_tta-ci_tta:.3f} to {subject_mean_tta+ci_tta:.3f})")
+                                logger.info(f"Pre-TTA Accuracy: {subject_mean_pre:.3f} ± {subject_std_pre:.3f} (95% CI: {subject_mean_pre-ci_pre:.3f} to {subject_mean_pre+ci_pre:.3f})")
+                                args.log.record(f"TTA Accuracy: {subject_mean_tta:.3f} ± {subject_std_tta:.3f} (95% CI: {subject_mean_tta-ci_tta:.3f} to {subject_mean_tta+ci_tta:.3f})")
+                                args.log.record(f"Pre-TTA Accuracy: {subject_mean_pre:.3f} ± {subject_std_pre:.3f} (95% CI: {subject_mean_pre-ci_pre:.3f} to {subject_mean_pre+ci_pre:.3f})")
 
-                # Run training and evaluation for this subject and seed
-                tta_acc, pre_acc = train_target(args)
-                
-                # Store results
-                total_acc[seed_idx, idt] = tta_acc
-                pre_acc_all_seeds[seed_idx, idt] = pre_acc
+                                # Ensemble evaluation across seeds for this subject
+                                # reload target labels for this subject
+                                _, _, X_tar_sub, y_tar_sub = args.mi_data_loaded
 
-                # Log results for this subject and seed
-                logger.info(f"Subject {target_str} with Seed {s} - TTA Acc: {tta_acc:.3f}, Pre-TTA: {pre_acc:.3f}")
-                args.log.record(f"Subject {target_str} with Seed {s} - TTA Acc: {tta_acc:.3f}, Pre-TTA: {pre_acc:.3f}")
-                
-                # Save per-seed, per-subject results
-                np.savetxt(
-                    os.path.join(args.result_dir, f"{data_name}_T-TIME_seed_{args.SEED}_subject_{idt}_acc.csv"),
-                    np.array([tta_acc, pre_acc]), delimiter=","
-                )
-                
-                # Clear GPU memory between seeds
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            
-            # After all seeds for this subject, print summary for this subject
-            subject_mean_tta = np.mean(total_acc[:, idt])
-            subject_std_tta = np.std(total_acc[:, idt])
-            subject_mean_pre = np.mean(pre_acc_all_seeds[:, idt])
-            subject_std_pre = np.std(pre_acc_all_seeds[:, idt])
+                                preds_seeds = []
+                                for s in seeds:
+                                    pred_file = os.path.join(
+                                        args.result_dir,
+                                        f"{args.data_name}_T-TIME_seed_{s}_tta_probs.csv"  # load post-adaptation probs
+                                    )
+                                    # load TTA probs
+                                    flat = []
+                                    with open(pred_file, 'r') as fr:
+                                        for line in fr:
+                                            parts = line.strip().split(',')
+                                            flat.extend([float(x) for x in parts if x])
+                                    preds_seeds.append(np.array(flat))
+                                preds_arr = np.stack(preds_seeds, axis=0)  # now shape (n_seeds, n_trials)
 
-            # Calculate 95% confidence intervals (for small sample sizes using t-distribution)
-            from scipy import stats
-            n_seeds = len(seeds)
-            confidence = 0.95
-            # t-value for 95% confidence with n-1 degrees of freedom
-            t_val = stats.t.ppf((1 + confidence) / 2, n_seeds - 1)
-            ci_tta = t_val * (subject_std_tta / np.sqrt(n_seeds))
-            ci_pre = t_val * (subject_std_pre / np.sqrt(n_seeds))
-            
-            logger.info(f"=== Subject {target_str} Summary Across All Seeds ===")
-            logger.info(f"TTA Accuracy: {subject_mean_tta:.3f} ± {subject_std_tta:.3f} (95% CI: {subject_mean_tta-ci_tta:.3f} to {subject_mean_tta+ci_tta:.3f})")
-            logger.info(f"Pre-TTA Accuracy: {subject_mean_pre:.3f} ± {subject_std_pre:.3f} (95% CI: {subject_mean_pre-ci_pre:.3f} to {subject_mean_pre+ci_pre:.3f})")
-            args.log.record(f"TTA Accuracy: {subject_mean_tta:.3f} ± {subject_std_tta:.3f} (95% CI: {subject_mean_tta-ci_tta:.3f} to {subject_mean_tta+ci_tta:.3f})")
-            args.log.record(f"Pre-TTA Accuracy: {subject_mean_pre:.3f} ± {subject_std_pre:.3f} (95% CI: {subject_mean_pre-ci_pre:.3f} to {subject_mean_pre+ci_pre:.3f})")
+                                # 1) Majority‐vote on hard labels
+                                labels = (preds_arr > 0.5).astype(int)
+                                maj_vote = (labels.sum(axis=0) >= (len(seeds)/2)).astype(int)
+                                acc_maj = accuracy_score(y_tar_sub, maj_vote) * 100
 
-            # Ensemble evaluation across seeds for this subject
-            # reload target labels for this subject
-            _, _, X_tar_sub, y_tar_sub = args.mi_data_loaded
+                                # 2) Mean probability decision
+                                mean_prob = preds_arr.mean(axis=0)
+                                mean_vote = (mean_prob > 0.5).astype(int)
+                                acc_mean = accuracy_score(y_tar_sub, mean_vote) * 100
 
-            preds_seeds = []
-            for s in seeds:
-                pred_file = os.path.join(
-                    args.result_dir,
-                    f"{args.data_name}_T-TIME_seed_{s}_tta_probs.csv"  # load post-adaptation probs
-                )
-                # load TTA probs
-                flat = []
-                with open(pred_file, 'r') as fr:
-                    for line in fr:
-                        parts = line.strip().split(',')
-                        flat.extend([float(x) for x in parts if x])
-                preds_seeds.append(np.array(flat))
-            preds_arr = np.stack(preds_seeds, axis=0)  # now shape (n_seeds, n_trials)
+                                # 3) Median probability decision
+                                med_prob = np.median(preds_arr, axis=0)
+                                med_vote = (med_prob > 0.5).astype(int)
+                                acc_med = accuracy_score(y_tar_sub, med_vote) * 100
 
-            # 1) Majority‐vote on hard labels
-            labels = (preds_arr > 0.5).astype(int)
-            maj_vote = (labels.sum(axis=0) >= (len(seeds)/2)).astype(int)
-            acc_maj = accuracy_score(y_tar_sub, maj_vote) * 100
+                                # 4) SML‐based ensemble
+                                sml_pred = SML(preds_arr)
+                                acc_sml = accuracy_score(y_tar_sub, sml_pred) * 100
 
-            # 2) Mean probability decision
-            mean_prob = preds_arr.mean(axis=0)
-            mean_vote = (mean_prob > 0.5).astype(int)
-            acc_mean = accuracy_score(y_tar_sub, mean_vote) * 100
+                                # report ensemble results (no majority vote)
+                                logger.info(f"Ensemble TTA: MeanProb={acc_mean:.2f}%, MedianProb={acc_med:.2f}%, SML={acc_sml:.2f}%")
+                                args.log.record(f"Ensemble TTA: MeanProb={acc_mean:.2f}%, MedianProb={acc_med:.2f}%, SML={acc_sml:.2f}%")
+                                ensemble_tta_all.append([acc_mean, acc_med, acc_sml])
+                                # session‐wise TTA breakdown
+                                sess_tta = []
+                                for idx, (s, e) in enumerate(getattr(args, 'tar_bounds', [])):
+                                    sess_name = args.session_names[idx]
+                                    sub_preds = preds_arr[:, s:e]
+                                    sub_labels = y_tar_sub[s:e]
+                                    maj_vote       = (sub_preds > 0.5).sum(axis=0) >= (len(seeds)/2)
+                                    mean_prob      = sub_preds.mean(axis=0) > 0.5
+                                    med_prob       = np.median(sub_preds, axis=0) > 0.5
+                                    sml_pred       = SML(sub_preds)
+                                    acc_maj_s      = accuracy_score(sub_labels, maj_vote) * 100
+                                    acc_mean_s     = accuracy_score(sub_labels, mean_prob) * 100
+                                    acc_med_s      = accuracy_score(sub_labels, med_prob) * 100
+                                    acc_sml_s      = accuracy_score(sub_labels, sml_pred) * 100
+                                    logger.info(f"   Session {sess_name} Ensemble TTA breakdown: Maj={acc_maj_s:.2f}%, Mean={acc_mean_s:.2f}%, Median={acc_med_s:.2f}%, SML={acc_sml_s:.2f}%")
+                                    args.log.record(f"   Session {sess_name} Ensemble TTA breakdown: Maj={acc_maj_s:.2f}%, Mean={acc_mean_s:.2f}%, Median={acc_med_s:.2f}%, SML={acc_sml_s:.2f}%")
+                                    sess_tta.append([acc_maj_s, acc_mean_s, acc_med_s, acc_sml_s])
+                                session_tta_breakdowns.append((subject_names[idt], sess_tta))
 
-            # 3) Median probability decision
-            med_prob = np.median(preds_arr, axis=0)
-            med_vote = (med_prob > 0.5).astype(int)
-            acc_med = accuracy_score(y_tar_sub, med_vote) * 100
-
-            # 4) SML‐based ensemble
-            sml_pred = SML(preds_arr)
-            acc_sml = accuracy_score(y_tar_sub, sml_pred) * 100
-
-            # report ensemble results (no majority vote)
-            logger.info(f"Ensemble TTA: MeanProb={acc_mean:.2f}%, MedianProb={acc_med:.2f}%, SML={acc_sml:.2f}%")
-            args.log.record(f"Ensemble TTA: MeanProb={acc_mean:.2f}%, MedianProb={acc_med:.2f}%, SML={acc_sml:.2f}%")
-            ensemble_tta_all.append([acc_mean, acc_med, acc_sml])
-            # session‐wise TTA breakdown
-            sess_tta = []
-            for idx, (s, e) in enumerate(getattr(args, 'tar_bounds', [])):
-                sess_name = args.session_names[idx]
-                sub_preds = preds_arr[:, s:e]
-                sub_labels = y_tar_sub[s:e]
-                maj_vote       = (sub_preds > 0.5).sum(axis=0) >= (len(seeds)/2)
-                mean_prob      = sub_preds.mean(axis=0) > 0.5
-                med_prob       = np.median(sub_preds, axis=0) > 0.5
-                sml_pred       = SML(sub_preds)
-                acc_maj_s      = accuracy_score(sub_labels, maj_vote) * 100
-                acc_mean_s     = accuracy_score(sub_labels, mean_prob) * 100
-                acc_med_s      = accuracy_score(sub_labels, med_prob) * 100
-                acc_sml_s      = accuracy_score(sub_labels, sml_pred) * 100
-                logger.info(f"   Session {sess_name} Ensemble TTA breakdown: Maj={acc_maj_s:.2f}%, Mean={acc_mean_s:.2f}%, Median={acc_med_s:.2f}%, SML={acc_sml_s:.2f}%")
-                args.log.record(f"   Session {sess_name} Ensemble TTA breakdown: Maj={acc_maj_s:.2f}%, Mean={acc_mean_s:.2f}%, Median={acc_med_s:.2f}%, SML={acc_sml_s:.2f}%")
-                sess_tta.append([acc_maj_s, acc_mean_s, acc_med_s, acc_sml_s])
-            session_tta_breakdowns.append((subject_names[idt], sess_tta))
-
-            # Ensemble summary for Pre-TTA probabilities across seeds
-            pre_list = []
-            for s in seeds:
-                pp = np.loadtxt(os.path.join(args.result_dir,
-                    f"{args.data_name}_T-TIME_seed_{s}_pre_probs.csv"), delimiter=',')
-                prob1 = pp[:,1] if pp.ndim>1 else pp
-                pre_list.append(prob1)
-            pre_mat = np.stack(pre_list, axis=0)  # shape (n_seeds, n_trials)
-            th = getattr(args, 'pre_thresh', 0.5)
-            pre_labels = (pre_mat > th).astype(int)
-            pre_maj = (pre_labels.sum(axis=0) >= (len(seeds)/2)).astype(int)
-            acc_pre_maj = accuracy_score(y_tar_sub, pre_maj) * 100
-            # mean & median decisions using same threshold
-            pre_mean_vote = (pre_mat.mean(axis=0) > th).astype(int)
-            pre_med_vote  = (np.median(pre_mat, axis=0) > th).astype(int)
-            # compute mean/median accuracy
-            acc_pre_mean = accuracy_score(y_tar_sub, pre_mean_vote) * 100
-            acc_pre_med  = accuracy_score(y_tar_sub, pre_med_vote) * 100
-            # SML on soft probabilities
-            pre_sml = SML(pre_mat)
-            acc_pre_sml  = accuracy_score(y_tar_sub, pre_sml) * 100
-            logger.info(f"Ensemble Pre-TTA: Majority={acc_pre_maj:.2f}%, MeanProb={acc_pre_mean:.2f}%, MedianProb={acc_pre_med:.2f}%, SML={acc_pre_sml:.2f}")
-            args.log.record(f"Ensemble Pre-TTA: Majority={acc_pre_maj:.2f}%, MeanProb={acc_pre_mean:.2f}%, MedianProb={acc_pre_med:.2f}%, SML={acc_pre_sml:.2f}")
-            ensemble_pre_all.append([acc_pre_maj, acc_pre_mean, acc_pre_med, acc_pre_sml])
-            # session‐wise Pre-TTA breakdown
-            sess_pre = []
-            for idx, (s, e) in enumerate(getattr(args, 'tar_bounds', [])):
-                sess_name = args.session_names[idx]
-                sub_preds_pre = pre_mat[:, s:e]
-                sub_labels_pre= y_tar_sub[s:e]
-                maj_vote_p      = (sub_preds_pre > th).sum(axis=0) >= (len(seeds)/2)
-                mean_prob_p     = sub_preds_pre.mean(axis=0) > th
-                med_prob_p      = np.median(sub_preds_pre, axis=0) > th
-                sml_pred_p      = SML(sub_preds_pre)
-                acc_maj_p_s     = accuracy_score(sub_labels_pre, maj_vote_p) * 100
-                acc_mean_p_s    = accuracy_score(sub_labels_pre, mean_prob_p) * 100
-                acc_med_p_s     = accuracy_score(sub_labels_pre, med_prob_p) * 100
-                acc_sml_p_s     = accuracy_score(sub_labels_pre, sml_pred_p) * 100
-                logger.info(f"   Session {sess_name} Ensemble Pre-TTA breakdown: Maj={acc_maj_p_s:.2f}%, Mean={acc_mean_p_s:.2f}%, Median={acc_med_p_s:.2f}%, SML={acc_sml_p_s:.2f}%")
-                args.log.record(f"   Session {sess_name} Ensemble Pre-TTA breakdown: Maj={acc_maj_p_s:.2f}%, Mean={acc_mean_p_s:.2f}%, Median={acc_med_p_s:.2f}%, SML={acc_sml_p_s:.2f}%")
-                sess_pre.append([acc_maj_p_s, acc_mean_p_s, acc_med_p_s, acc_sml_p_s])
-            session_pre_breakdowns.append((subject_names[idt], sess_pre))
+                                # Ensemble summary for Pre-TTA probabilities across seeds
+                                pre_list = []
+                                for s in seeds:
+                                    pp = np.loadtxt(os.path.join(args.result_dir,
+                                        f"{args.data_name}_T-TIME_seed_{s}_pre_probs.csv"), delimiter=',')
+                                    prob1 = pp[:,1] if pp.ndim>1 else pp
+                                    pre_list.append(prob1)
+                                pre_mat = np.stack(pre_list, axis=0)  # shape (n_seeds, n_trials)
+                                th = getattr(args, 'pre_thresh', 0.5)
+                                pre_labels = (pre_mat > th).astype(int)
+                                pre_maj = (pre_labels.sum(axis=0) >= (len(seeds)/2)).astype(int)
+                                acc_pre_maj = accuracy_score(y_tar_sub, pre_maj) * 100
+                                # mean & median decisions using same threshold
+                                pre_mean_vote = (pre_mat.mean(axis=0) > th).astype(int)
+                                pre_med_vote  = (np.median(pre_mat, axis=0) > th).astype(int)
+                                # compute mean/median accuracy
+                                acc_pre_mean = accuracy_score(y_tar_sub, pre_mean_vote) * 100
+                                acc_pre_med  = accuracy_score(y_tar_sub, pre_med_vote) * 100
+                                # SML on soft probabilities
+                                pre_sml = SML(pre_mat)
+                                acc_pre_sml  = accuracy_score(y_tar_sub, pre_sml) * 100
+                                logger.info(f"Ensemble Pre-TTA: Majority={acc_pre_maj:.2f}%, MeanProb={acc_pre_mean:.2f}%, MedianProb={acc_pre_med:.2f}%, SML={acc_pre_sml:.2f}")
+                                args.log.record(f"Ensemble Pre-TTA: Majority={acc_pre_maj:.2f}%, MeanProb={acc_pre_mean:.2f}%, MedianProb={acc_pre_med:.2f}%, SML={acc_pre_sml:.2f}")
+                                ensemble_pre_all.append([acc_pre_maj, acc_pre_mean, acc_pre_med, acc_pre_sml])
+                                # session‐wise Pre-TTA breakdown
+                                sess_pre = []
+                                for idx, (s, e) in enumerate(getattr(args, 'tar_bounds', [])):
+                                    sess_name = args.session_names[idx]
+                                    sub_preds_pre = pre_mat[:, s:e]
+                                    sub_labels_pre= y_tar_sub[s:e]
+                                    maj_vote_p      = (sub_preds_pre > th).sum(axis=0) >= (len(seeds)/2)
+                                    mean_prob_p     = sub_preds_pre.mean(axis=0) > th
+                                    med_prob_p      = np.median(sub_preds_pre, axis=0) > th
+                                    sml_pred_p      = SML(sub_preds_pre)
+                                    acc_maj_p_s     = accuracy_score(sub_labels_pre, maj_vote_p) * 100
+                                    acc_mean_p_s    = accuracy_score(sub_labels_pre, mean_prob_p) * 100
+                                    acc_med_p_s     = accuracy_score(sub_labels_pre, med_prob_p) * 100
+                                    acc_sml_p_s     = accuracy_score(sub_labels_pre, sml_pred_p) * 100
+                                    logger.info(f"   Session {sess_name} Ensemble Pre-TTA breakdown: Maj={acc_maj_p_s:.2f}%, Mean={acc_mean_p_s:.2f}%, Median={acc_med_p_s:.2f}%, SML={acc_sml_p_s:.2f}%")
+                                    args.log.record(f"   Session {sess_name} Ensemble Pre-TTA breakdown: Maj={acc_maj_p_s:.2f}%, Mean={acc_mean_p_s:.2f}%, Median={acc_med_p_s:.2f}%, SML={acc_sml_p_s:.2f}%")
+                                    sess_pre.append([acc_maj_p_s, acc_mean_p_s, acc_med_p_s, acc_sml_p_s])
+                                session_pre_breakdowns.append((subject_names[idt], sess_pre))
 
 
         # ─── Final summary across all subjects ───────────────────────────────
