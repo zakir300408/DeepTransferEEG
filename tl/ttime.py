@@ -288,23 +288,18 @@ def train_target(args):
     base_network = nn.Sequential(netF, netC).to(args.device)
 
     if args.max_epoch == 0:
-        # compute Pre-TTA metric
-        if args.balanced:
-            acc_val, _ = cal_acc_comb(dset_loaders["Target"], base_network, args=args)
-        else:
-            acc_val = cal_score_online(dset_loaders["Target-Imbalanced"], base_network, args=args)
-        pre_acc = acc_val
-        # perform a quick evaluation and print results
-        if args.balanced:
-            acc_val, _ = cal_acc_comb(dset_loaders["Target"], base_network, args=args)
-            metric = "Acc"
-        else:
-            acc_val = cal_score_online(dset_loaders["Target-Imbalanced"], base_network, args=args)
-            metric = "AUC"
-        logger.info(f"Task: {args.task_str}, Pre-TTA IEA {metric} = {acc_val:.2f}%")
-        args.log.record(f"Task: {args.task_str}, Pre-TTA IEA {metric} = {acc_val:.2f}%")
+        # load pretrained source‐model checkpoint for fair comparison
+        best_ckpt = f'./runs/{args.data_name}/{args.backbone}_S{idt_str}_seed{args.SEED}{extra_string}_best.ckpt'
+        base_network.load_state_dict(torch.load(best_ckpt, map_location=args.device))
+        base_network.eval()
 
-        # after loading best model, save Pre-TTA probabilities
+        # unify metric: use online streaming scoring on the same split
+        metric = "Acc" if args.balanced else "AUC"
+        pre_acc = cal_score_online(dset_loaders["Target-Online"], base_network, args=args)
+        logger.info(f"Task: {args.task_str}, Pre-TTA IEA {metric} = {pre_acc:.2f}%")
+        args.log.record(f"Task: {args.task_str}, Pre-TTA IEA {metric} = {pre_acc:.2f}%")
+
+        # after loading best model, save Pre‐TTA probabilities
         # Route Pre-TTA through TTIME (align=True, no adaptation)
         base_network.eval()
         loader_pre = DataLoader(
