@@ -10,7 +10,7 @@ from pathlib import Path
 
 def main():
     # Define the root Data_Epoch directory
-    root_dir = Path(r"E:\Exoskeleton_DL\XK_work\data_epoch_filtered")
+    root_dir = Path(r"E:\Exoskeleton_DL\XK_work\Data_Epoch")
 
     # Counters for summary
     processed_count = 0
@@ -54,6 +54,18 @@ def main():
         print("Errors encountered:")
         for file_path, error_msg in errors:
             print(f" - {file_path}: {error_msg}")
+
+    # Remove empty directories (excluding root_dir)
+    for dirpath, dirnames, filenames in os.walk(root_dir, topdown=False):
+        path = Path(dirpath)
+        if path == root_dir:
+            continue
+        # If directory is empty, remove it
+        if not any(path.iterdir()):
+            try:
+                path.rmdir()
+            except Exception as e:
+                print(f"Could not remove {path}: {e}")
 
 if __name__ == "__main__":
     main()

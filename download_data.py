@@ -35,7 +35,7 @@ def dataset_to_file(dataset_name, data_save):
         paradigm = MotorImagery(n_classes=2)
         # (5600, 13, 2561) (5600,) 512Hz 12subjects * 2 classes * (200 + 200 + (200 for Subj 8/9/10/11)) trials * (2/3)sessions
     elif dataset_name == 'CustomEpoch':
-        root_dir = r"E:\Exoskeleton_DL\XK_work\data_epoch_filtered"
+        root_dir = r"E:\Exoskeleton_DL\XK_work\Data_Epoch"
         mat_files = sorted(glob.glob(os.path.join(root_dir, "*", "*.mat")))
         if not mat_files:
             raise ValueError(f"No .mat files found in CustomEpoch path {root_dir}")

@@ -6,7 +6,9 @@ import numpy as np
 import pandas as pd
 from sklearn import preprocessing
 from scipy.signal import butter, filtfilt, iirnotch, spectrogram
-from utils.data_utils import traintest_split_cross_subject, traintest_split_domain_classifier, traintest_split_multisource, traintest_split_domain_classifier_pretest, traintest_split_multisource
+from joblib import Parallel, delayed
+from utils.data_utils import traintest_split_cross_subject, traintest_split_domain_classifier, \
+                              traintest_split_multisource, traintest_split_domain_classifier_pretest
 
 
 def data_process(dataset):
@@ -40,34 +42,28 @@ def data_process(dataset):
         sample_rate  = 200
         ch_num       = X.shape[1]
 
-        # apply 50 Hz notch
+        # apply 50 Hz notch and 8–32 Hz bandpass in one go:
         nyq = sample_rate / 2
-        f0, Q = 50.0, 30.0
-        bn, an = iirnotch(f0/nyq, Q)
-        for i in range(X.shape[0]):
-            for j in range(X.shape[1]):
-                X[i, j, :] = filtfilt(bn, an, X[i, j, :])
+        bn, an = iirnotch(50.0/nyq, 30.0)
+        b, a   = butter(5, [8/nyq, 32/nyq], btype='band')
+        # vectorized filtering over time‐axis
+        X = filtfilt(bn, an, X, axis=2)
+        X = filtfilt(b, a,   X, axis=2)
 
-        # apply a bandpass of 8–32 Hz
-        b, a = butter(5, [8/nyq, 32/nyq], btype='band')
-        for i in range(X.shape[0]):
-            for j in range(X.shape[1]):
-                X[i, j, :] = filtfilt(b, a, X[i, j, :])
-        
-        # ========== NEW: compute time-frequency features ==========
-        # parameters for spectrogram
+        # ========== NEW: compute time-frequency features in parallel ==========
         nperseg, noverlap = 128, 64
-        tf_feats = np.zeros((X.shape[0], X.shape[1],
-                             *(spectrogram(X[0,0], sample_rate, nperseg=nperseg, noverlap=noverlap)[2].shape)))
-        for i in range(X.shape[0]):
-            for j in range(X.shape[1]):
-                f, t, Sxx = spectrogram(X[i, j, :], fs=sample_rate,
-                                         nperseg=nperseg, noverlap=noverlap)
-                tf_feats[i, j] = Sxx  # shape (freq_bins, time_bins)
-        # optionally log‐scale or z-score tf_feats here
-        # flatten tf dims into one axis
+        # get freq/time dims
+        _, _, S0 = spectrogram(X[0,0], fs=sample_rate, nperseg=nperseg, noverlap=noverlap)
+        freq_bins, time_bins = S0.shape
+        # flatten trial/channel dims
+        flat_X = X.reshape(-1, X.shape[2])
+        def _compute_sxx(x):
+            return spectrogram(x, fs=sample_rate, nperseg=nperseg, noverlap=noverlap)[2]
+        sxx_list = Parallel(n_jobs=-1)(delayed(_compute_sxx)(flat_X[k])
+                                       for k in range(flat_X.shape[0]))
+        tf_feats = np.stack(sxx_list).reshape(X.shape[0], X.shape[1], freq_bins, time_bins)
+        # flatten and concat
         tf_flat = tf_feats.reshape(X.shape[0], X.shape[1], -1)
-        # concatenate raw time and TF features
         X = np.concatenate([X, tf_flat], axis=2)
         # ===========================================================
         
@@ -184,33 +180,24 @@ def data_process_secondsession(dataset):
         paradigm     = 'MI'
         sample_rate  = 200             # Hz, as set in dnn.py
         ch_num       = X.shape[1]      # channels
-        # apply 8–32 Hz bandpass
+        # apply 8–32 Hz bandpass then 50 Hz notch in one go:
         nyq = sample_rate / 2
-        b, a = butter(5, [8/nyq, 32/nyq], btype='band')
-        for i in range(X.shape[0]):
-            for j in range(X.shape[1]):
-                X[i, j, :] = filtfilt(b, a, X[i, j, :])
-        # apply 50 Hz notch
-        f0, Q = 50.0, 30.0
-        bn, an = iirnotch(f0/nyq, Q)
-        for i in range(X.shape[0]):
-            for j in range(X.shape[1]):
-                X[i, j, :] = filtfilt(bn, an, X[i, j, :])
+        b, a   = butter(5, [8/nyq, 32/nyq], btype='band')
+        bn, an = iirnotch(50.0/nyq, 30.0)
+        X = filtfilt(b, a,   X, axis=2)
+        X = filtfilt(bn, an, X, axis=2)
 
-        # ========== NEW: compute time-frequency features ==========
-        # parameters for spectrogram
+        # ========== NEW: compute time-frequency features in parallel ==========
         nperseg, noverlap = 128, 64
-        tf_feats = np.zeros((X.shape[0], X.shape[1],
-                             *(spectrogram(X[0,0], sample_rate, nperseg=nperseg, noverlap=noverlap)[2].shape)))
-        for i in range(X.shape[0]):
-            for j in range(X.shape[1]):
-                f, t, Sxx = spectrogram(X[i, j, :], fs=sample_rate,
-                                         nperseg=nperseg, noverlap=noverlap)
-                tf_feats[i, j] = Sxx  # shape (freq_bins, time_bins)
-        # optionally log‐scale or z-score tf_feats here
-        # flatten tf dims into one axis
+        _, _, S0 = spectrogram(X[0,0], fs=sample_rate, nperseg=nperseg, noverlap=noverlap)
+        freq_bins, time_bins = S0.shape
+        flat_X = X.reshape(-1, X.shape[2])
+        def _compute_sxx(x):
+            return spectrogram(x, fs=sample_rate, nperseg=nperseg, noverlap=noverlap)[2]
+        sxx_list = Parallel(n_jobs=-1)(delayed(_compute_sxx)(flat_X[k])
+                                       for k in range(flat_X.shape[0]))
+        tf_feats = np.stack(sxx_list).reshape(X.shape[0], X.shape[1], freq_bins, time_bins)
         tf_flat = tf_feats.reshape(X.shape[0], X.shape[1], -1)
-        # concatenate raw time and TF features
         X = np.concatenate([X, tf_flat], axis=2)
         # ===========================================================
 

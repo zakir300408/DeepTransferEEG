@@ -70,8 +70,11 @@ def TTIME(loader, model, args, balanced=True):
     # loop through test data stream one by one
     for i in range(len(loader)):
         #################### Phase 1: target label prediction ####################
+        # time data loading & prep
+        dl_start = time.time()
         model.eval()
         data = next(iter_test)
+        # inputs→data_cum→sample_test prep
         inputs, labels = data[0], data[1]
         inputs = inputs.reshape(1,1,inputs.shape[-2],inputs.shape[-1]).to(args.device)
 
@@ -86,6 +89,8 @@ def TTIME(loader, model, args, balanced=True):
             data_cum = data_cum[-max_win:]
 
         if args.align:
+            # time EA (incremental alignment)
+            ea_start = time.time()
             # get sample as a GPU tensor
             # only use the most recent sample for alignment
             sample_tensor = data_cum[-1].reshape(args.chn, args.time_sample_num)
@@ -100,12 +105,19 @@ def TTIME(loader, model, args, balanced=True):
             sample_tensor = sqrtRefEA @ sample_tensor
             # reshape into batch
             sample_test = sample_tensor.reshape(1,1,args.chn,args.time_sample_num)
+            # log EA time
+            torch.cuda.synchronize() if args.device.type=='cuda' else None
+            ea_ms = (time.time() - ea_start)*1000
+            logger.debug(f"[T-TIME] iter {i}: EA_online + transform took {ea_ms:.1f} ms")
         else:
             # no alignment: just slice ON‐DEVICE
             sample_test = data_cum[i].unsqueeze(0)  # now (1,1,chn,time)
 
         # ensure tensor is float32 on correct device
         sample_test = sample_test.to(device=args.device, dtype=torch.float32)
+        # log data‐loading & prep time
+        dl_ms = (time.time() - dl_start)*1000
+        logger.debug(f"[T-TIME] iter {i}: data load & prep took {dl_ms:.1f} ms")
 
         _, outputs = model(sample_test)
 
@@ -138,6 +150,8 @@ def TTIME(loader, model, args, balanced=True):
         win = args.max_tta
         if (i+1) >= win and (i+1) % args.stride == 0:
             if args.align:
+                # time the alignment step
+                align_start = time.time()
                 # get raw window of size win
                 # get most recent window of size win without full history
                 raw = data_cum[-win:]           # (win,1,chn,time)
@@ -154,6 +168,9 @@ def TTIME(loader, model, args, balanced=True):
                 sqrtRefEA_w = evec_w @ torch.diag(ev_w.pow(-0.5)) @ evec_w.T
                 # align entire batch on GPU
                 aligned = torch.einsum('ij,bjt->bit', sqrtRefEA_w, flat.to(args.device))
+                torch.cuda.synchronize() if args.device.type=='cuda' else None
+                align_ms = (time.time() - align_start) * 1000
+                logger.debug(f"[T-TIME] iter {i}: alignment took {align_ms:.1f} ms")
                 batch_test = aligned.unsqueeze(1)    # (win,1,chn,time)
             else:
                 # slice last win samples and move to CPU for numpy
@@ -168,9 +185,12 @@ def TTIME(loader, model, args, balanced=True):
 
             start_time = time.time()
             for step in range(args.steps):
-
+                # forward timing
+                fwd_start = time.time()
                 _, outputs = model(batch_test)
-                outputs = outputs.float()   # keep on device to preserve gradient flow
+                torch.cuda.synchronize() if args.device.type=='cuda' else None
+                fwd_ms = (time.time() - fwd_start) * 1000
+                logger.debug(f"[T-TIME] iter {i}, step {step}: forward {fwd_ms:.1f} ms")
 
                 args.epsilon = 1e-5
                 softmax_out = nn.Softmax(dim=1)(outputs / args.t)
@@ -192,9 +212,14 @@ def TTIME(loader, model, args, balanced=True):
                     AMDR_loss = torch.sum(normed_qk * torch.log(normed_qk + args.epsilon))
                     loss = CEM_loss + AMDR_loss
 
+                # backward + step timing
+                opt_start = time.time()
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                torch.cuda.synchronize() if args.device.type=='cuda' else None
+                opt_ms = (time.time() - opt_start) * 1000
+                logger.debug(f"[T-TIME] iter {i}, step {step}: backward+opt {opt_ms:.1f} ms")
 
             TTA_time = time.time()
             if args.calc_time:
@@ -264,7 +289,15 @@ def train_target(args):
     os.makedirs(args.result_dir, exist_ok=True)
 
     # load source/target
-    X_src, y_src, X_tar, y_tar = read_mi_combine_tar(args)
+    # load source/target only once per subject
+    if not hasattr(args, 'mi_data_loaded'):
+        args.mi_data_loaded = read_mi_combine_tar(args)
+    X_src, y_src, X_tar, y_tar = args.mi_data_loaded
+
+    # build / cache data loaders with EA applied only once per subject
+    if not hasattr(args, 'dset_loaders_cached'):
+        args.dset_loaders_cached = data_loader(X_src, y_src, X_tar, y_tar, args)
+    dset_loaders = args.dset_loaders_cached
 
     # build per-session bounds for CustomEpoch
     if args.data == 'CustomEpoch':
@@ -279,8 +312,6 @@ def train_target(args):
         # map each bound to its actual session filename
         file_list = df_meta['file'].tolist()
         args.session_names = [file_list[i] for i in idts]
-
-    dset_loaders = data_loader(X_src, y_src, X_tar, y_tar, args)
 
     # move backbone and classifier to configured device
     netF, netC = backbone_net(args, return_type='xy')
@@ -496,7 +527,7 @@ if __name__ == '__main__':
         # whether to use pretrained model
         # if source models have not been trained, set use_pretrained_model to False to train them
         # alternatively, run dnn.py to train source models, in seperating the steps
-        use_pretrained_model = True
+        use_pretrained_model = False
         if use_pretrained_model:
             # no training
             max_epoch = 0
@@ -508,7 +539,7 @@ if __name__ == '__main__':
         lr = 0.0005
 
         # max_tta: maximum sliding‐window size for TTA
-        max_tta = 8
+        max_tta = 20
 
         # update step
         steps = 5
@@ -521,7 +552,7 @@ if __name__ == '__main__':
         align = True
 
         # temperature rescaling, for test entropy calculation
-        t = 1.8
+        t = 1.7
 
         # whether to test balanced or imbalanced (2:1) target subject
         balanced = True
@@ -556,7 +587,7 @@ if __name__ == '__main__':
         args.backbone = 'EEGNet'
 
         # train batch size
-        args.batch_size = 64
+        args.batch_size = 128
 
         # GPU device id
         # detect device and default to GPU if available
@@ -575,7 +606,13 @@ if __name__ == '__main__':
         my_log.log_init()
         my_log.record('=' * 50 + '\n' + os.path.basename(__file__) + '\n' + '=' * 50)
         args.log = my_log
-        
+
+        # ADD file handler to capture DEBUG timing into same log file
+        file_handler = logging.FileHandler(args.out_file.name)
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+        logger.addHandler(file_handler)
+
         # Initialize storage for results
         seeds = [2, 3, 5, 6,7,8,9,11,12]
         total_acc = np.zeros((len(seeds), N))
@@ -591,7 +628,12 @@ if __name__ == '__main__':
             target_str = subject_names[idt]
             idts = [i for i, fn in enumerate(files) if fn.split('_')[0] == target_str]
             args.idt = idts
-            
+            # Pre-load and cache subject data once per subject iteration
+            if not hasattr(args, 'mi_data_loaded'):
+                args.mi_data_loaded = read_mi_combine_tar(args)
+            else:
+                # refresh cache for the changed subject idt
+                args.mi_data_loaded = read_mi_combine_tar(args)
             # use prefix names
             others = subject_names.copy()
             others.pop(idt)
@@ -659,7 +701,7 @@ if __name__ == '__main__':
 
             # Ensemble evaluation across seeds for this subject
             # reload target labels for this subject
-            X_src, y_src, X_tar_sub, y_tar_sub = read_mi_combine_tar(args)
+            _, _, X_tar_sub, y_tar_sub = args.mi_data_loaded
 
             preds_seeds = []
             for s in seeds:
