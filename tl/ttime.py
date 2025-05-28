@@ -26,6 +26,8 @@ from torch.utils.data import DataLoader, TensorDataset
 import logging
 import os                                 # <— ensure os is imported for fsync
 import scipy.stats as stats
+from multiprocessing import Pool, cpu_count
+import copy
 
 # ── Logger setup ──────────────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
@@ -33,6 +35,69 @@ logger.setLevel(logging.INFO)
 _handler = logging.StreamHandler()
 _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
 logger.addHandler(_handler)
+
+# ── module‐level worker ────────────────────────────────────────────────────────
+def _run_one_seed_global(params):
+    """
+    Worker for one seed. Logs clean ASCII and uses UTF-8 file encoding.
+    """
+    args, idt, files, subject_names, s = params
+
+    # 1) Copy & seed
+    args_local = copy.deepcopy(args)
+    args_local.SEED = s
+    fix_random_seed(s)
+    torch.backends.cudnn.deterministic = True
+
+    # 2) Seed‐specific log file (UTF-8 encoded)
+    seed_log = f"log_T-TIME_{args_local.data_name}_{args_local.task_str}_seed{s}.txt"
+    seed_path = os.path.join(args_local.result_dir, seed_log)
+    try:
+        args_local.out_file.close()
+    except:
+        pass
+    args_local.out_file = open(seed_path, 'w', encoding='utf-8')
+
+    # Reconfigure the **same** module logger for this file
+    seed_logger = logging.getLogger(__name__)
+    seed_logger.setLevel(logging.INFO)
+    # remove any old FileHandlers
+    for h in list(seed_logger.handlers):
+        if isinstance(h, logging.FileHandler):
+            seed_logger.removeHandler(h)
+    # add new FileHandler with utf-8
+    fh = logging.FileHandler(seed_path, encoding='utf-8')
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+    seed_logger.addHandler(fh)
+
+    # Re-init your LogRecord wrapper
+    args_local.log = LogRecord(args_local)
+    args_local.log.log_init()
+
+    # 3) Log start
+    seed_logger.info(f"[Seed {s}] START")
+
+    # 4) Run training
+    tta_acc, pre_acc = train_target(args_local)
+
+    # 5) Log results (ASCII arrow -> )
+    seed_logger.info(f"[Seed {s}] Results -> TTA={tta_acc:.2f}%, Pre={pre_acc:.2f}%")
+    args_local.log.record(f"Seed {s}: TTA {tta_acc:.2f}%, Pre {pre_acc:.2f}%")
+
+    # 6) Save per‐seed CSV
+    np.savetxt(
+        os.path.join(args_local.result_dir,
+                     f"{args_local.data_name}_T-TIME_seed_{s}_subject_{idt}_acc.csv"),
+        np.array([tta_acc, pre_acc]),
+        delimiter=","
+    )
+
+    # 7) Free GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return tta_acc, pre_acc
+
 
 # helper: reset running stats of all BatchNorm layers
 def _reset_batchnorm(m):
@@ -584,9 +649,11 @@ def build_base_args(data_name, paradigm, N, chn, class_num,
     args.use_pretrained_model = True
     args.balanced         = True
     args.calc_time        = False
+    args.max_parallel_seeds = 4  # default parallel seeds
     args.device           = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     args.data_env         = 'gpu' if torch.cuda.is_available() else 'local'
     return args
+
 
 
 def setup_run(args, data_name, hp):
@@ -596,6 +663,8 @@ def setup_run(args, data_name, hp):
     args.t       = hp['t']
     args.lr      = hp['lr']
     args.steps   = hp['steps']
+    # prepare a concise task identifier used for log filenames
+    args.task_str = f"mtta{args.max_tta}_str{args.stride}_t{args.t}_lr{args.lr}_st{args.steps}"
     # epochs
     args.max_epoch = 0 if args.use_pretrained_model else 30
 
@@ -608,7 +677,7 @@ def setup_run(args, data_name, hp):
     )
     os.makedirs(args.result_dir, exist_ok=True)
 
-    # logging
+    # open a UTF-8–encoded run-level log
     log_name = (
         f"log_T-TIME_{data_name}_"
         f"mtta{args.max_tta}_str{args.stride}_t{args.t}_"
@@ -617,15 +686,15 @@ def setup_run(args, data_name, hp):
     log_path = os.path.join(args.result_dir, log_name)
     args.out_file = open(log_path, 'w', encoding='utf-8')
 
-    my_log = LogRecord(args)
-    my_log.log_init()
-    args.log = my_log
+    # hook up LogRecord (if you’re using it)
+    args.log = LogRecord(args)
+    args.log.log_init()
 
-    # reset handlers
-    for h in logger.handlers[:]:
+    # reconfigure the module‐level logger to write into that file (UTF-8)
+    for h in list(logger.handlers):
         if isinstance(h, logging.FileHandler):
             logger.removeHandler(h)
-    fh = logging.FileHandler(log_path)
+    fh = logging.FileHandler(log_path, encoding='utf-8')
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
     logger.addHandler(fh)
@@ -639,134 +708,116 @@ def setup_run(args, data_name, hp):
     args.log.record(combo_str)
 
 
+
 def run_subject(args, idt, files, subject_names, seeds):
+    """
+    1) Runs all seeds (in batches of args.max_parallel_seeds)
+    2) Logs per-seed and overall summaries
+    3) Logs *per-session* ensemble breakdown
+    4) Returns exactly what build_and_save_results needs
+    """
+    # — identify target & name task —
     target = subject_names[idt]
-    idts = [i for i, fn in enumerate(files) if fn.split('_')[0] == target]
-    args.idt = idts
+    args.idt = [i for i,f in enumerate(files) if f.split('_')[0] == target]
 
-    # load data
-    args.mi_data_loaded = read_mi_combine_tar(args)
+    # build per-session bounds & names (so your breakdown loop will run)
+    df_meta = pd.read_csv(os.path.join(args.local_dir, 'meta.csv'))
+    counts  = df_meta['n_trials'].values
+    sel = counts[args.idt]
+    starts = np.concatenate(([0], np.cumsum(sel)[:-1]))
+    ends   = np.cumsum(sel)
+    args.tar_bounds    = [(s,e) for s,e in zip(starts, ends)]
+    args.session_names = [df_meta['file'].iloc[i] for i in args.idt]
+    
+    # — header —
+    logger.info(f"\n=== Transfer to {target} ===")
+    args.log.record(f"Transfer to {target}")
 
-    # naming
-    others = subject_names.copy()
-    others.pop(idt)
-    args.task_str = 'Except_' + '_'.join(others) + '_2_' + target
+    # — prepare parallel seed params —
+    sane = {k: v for k, v in vars(args).items() if k not in ('log','out_file','mi_data_loaded')}
+    sanitized = argparse.Namespace(**sane)
+    params = [(sanitized, idt, files, subject_names, s) for s in seeds]
 
-    info = f"\n=== Transfer to {target} ==="
-    logger.info(info); args.log.record(info)
-
-    # per-seed storage
-    total_tta = np.zeros(len(seeds))
-    total_pre = np.zeros(len(seeds))
-
-    for si, s in enumerate(seeds):
-        args.SEED = s
-        logger.info(f"--- Subject {target}, Seed {s} ---")
-        args.log.record(f"--- Subject {target}, Seed {s} ---")
-
-        fix_random_seed(s)
-        torch.backends.cudnn.deterministic = True
-
-        tta_acc, pre_acc_val = train_target(args)
-        total_tta[si] = tta_acc
-        total_pre[si] = pre_acc_val
-
-        logger.info(f"TTA {tta_acc:.3f}, Pre {pre_acc_val:.3f}")
-        args.log.record(f"TTA {tta_acc:.3f}, Pre {pre_acc_val:.3f}")
-
-        # save per-seed accuracy
-        np.savetxt(
-            os.path.join(
-                args.result_dir,
-                f"{args.data}_T-TIME_seed_{s}_subject_{idt}_acc.csv"
-            ),
-            np.array([tta_acc, pre_acc_val]),
-            delimiter=","
-        )
+    # — dispatch in batches of K seeds —
+    K = getattr(args, 'max_parallel_seeds', 4)
+    results = []
+    for i in range(0, len(params), K):
+        batch = params[i:i+K]
+        batch_seeds = [p[4] for p in batch]
+        logger.info(f"Processing seeds batch: {batch_seeds}")
+        with Pool(processes=len(batch)) as pool:
+            results.extend(pool.map(_run_one_seed_global, batch))
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # subject‐level summary
-    n = len(seeds)
+    # — per-seed summary —
+    total_tta = np.array([r[0] for r in results])
+    total_pre = np.array([r[1] for r in results])
+    for s, tta, pre in zip(seeds, total_tta, total_pre):
+        logger.info(f"[Summary] Seed {s} -> TTA={tta:.2f}%, Pre={pre:.2f}%")
+        args.log.record(f"Seed {s} summary: TTA {tta:.2f}%, Pre {pre:.2f}%")
+
+    # — subject-level 95% CI —
+    n     = len(seeds)
     t_val = stats.t.ppf(0.975, n-1)
-    mu_tta, sd_tta = total_tta.mean(), total_tta.std()
-    ci_tta = t_val * sd_tta / np.sqrt(n)
-    mu_pre, sd_pre = total_pre.mean(), total_pre.std()
-    ci_pre = t_val * sd_pre / np.sqrt(n)
-
+    mu_t, sd_t = total_tta.mean(), total_tta.std()
+    ci_t = t_val * sd_t / np.sqrt(n)
+    mu_p, sd_p = total_pre.mean(), total_pre.std()
+    ci_p = t_val * sd_p / np.sqrt(n)
     summary = (
-        f"{target}: TTA {mu_tta:.3f}±{sd_tta:.3f} (95% CI [{mu_tta-ci_tta:.3f}, {mu_tta+ci_tta:.3f}]); "
-        f"Pre {mu_pre:.3f}±{sd_pre:.3f} (95% CI [{mu_pre-ci_pre:.3f}, {mu_pre+ci_pre:.3f}])"
+        f"{target}: TTA {mu_t:.3f}±{sd_t:.3f} "
+        f"(95% CI [{mu_t-ci_t:.3f}, {mu_t+ci_t:.3f}]); "
+        f"Pre {mu_p:.3f}±{sd_p:.3f} "
+        f"(95% CI [{mu_p-ci_p:.3f}, {mu_p+ci_p:.3f}])"
     )
-    logger.info(summary); args.log.record(summary)
+    logger.info(summary)
+    args.log.record(summary)
 
-    # --- load all TTA probs and ensemble ---
-    _, _, X_tar, y_tar = args.mi_data_loaded
-
-    # load Pre-TTA probs (each file is shape (n_samples,))
+    # — reload data & stack per-seed prob files —
+    _, _, X_tar, y_tar = read_mi_combine_tar(args)
     preds_pre = np.vstack([
-        np.loadtxt(
-            os.path.join(
-                args.result_dir,
-                f"{args.data_name}_T-TIME_seed_{s}_pre_probs.csv"
-            ),
-            delimiter=","
-        )
+        np.loadtxt(os.path.join(
+            args.result_dir,
+            f"{args.data_name}_T-TIME_seed_{s}_pre_probs.csv"
+        ), delimiter=",")
         for s in seeds
-    ])  # shape: (n_seeds, n_samples)
-
-    # load T-TTA probs (each file is shape (n_samples,))
-    preds_tta = [
-        np.loadtxt(
-            os.path.join(args.result_dir,
-                         f"{args.data_name}_T-TIME_seed_{s}_tta_probs.csv"),
-            delimiter=","
-        )
+    ])
+    preds_tta = np.vstack([
+        np.loadtxt(os.path.join(
+            args.result_dir,
+            f"{args.data_name}_T-TIME_seed_{s}_tta_probs.csv"
+        ), delimiter=",")
         for s in seeds
-    ]
-    preds_tta = np.vstack(preds_tta)    # now (n_seeds, n_samples)
+    ])
 
-    labels_tta = (preds_tta > 0.5).astype(int)
-    mean_vote_tta   = (preds_tta.mean(0) > 0.5).astype(int)
-    med_vote_tta    = (np.median(preds_tta, 0) > 0.5).astype(int)
-    sml_vote_tta    = SML(preds_tta)
-
+    # — overall ensemble accuracies —
+    mean_vote_tta = (preds_tta.mean(0) > 0.5).astype(int)
+    med_vote_tta  = (np.median(preds_tta, 0) > 0.5).astype(int)
+    sml_vote_tta  = SML(preds_tta)
     acc_tta = [
         accuracy_score(y_tar, mean_vote_tta) * 100,
-        accuracy_score(y_tar, med_vote_tta) * 100,
-        accuracy_score(y_tar, sml_vote_tta) * 100
+        accuracy_score(y_tar, med_vote_tta)  * 100,
+        accuracy_score(y_tar, sml_vote_tta)  * 100
     ]
-    logger.info(
-        f"Ensemble TTA: MeanProb={acc_tta[0]:.2f}%, "
-        f"MedianProb={acc_tta[1]:.2f}%, SML={acc_tta[2]:.2f}%"
-    )
-    args.log.record(
-        f"Ensemble TTA: MeanProb={acc_tta[0]:.2f}%, "
-        f"MedianProb={acc_tta[1]:.2f}%, SML={acc_tta[2]:.2f}%"
-    )
 
-    # ← replace with single‐column load via numpy:
-    preds_pre = np.vstack([
-        np.loadtxt(
-            os.path.join(
-                args.result_dir,
-                f"{args.data_name}_T-TIME_seed_{s}_pre_probs.csv"
-            ),
-            delimiter=","
-        )
-        for s in seeds
-    ])  # shape: (n_seeds, n_samples)
-
-    # now compute votes exactly as for TTA:
     mean_vote_pre = (preds_pre.mean(0) > 0.5).astype(int)
     med_vote_pre  = (np.median(preds_pre, 0) > 0.5).astype(int)
     sml_vote_pre  = SML(preds_pre)
-
     acc_pre_ens = [
         accuracy_score(y_tar, mean_vote_pre) * 100,
-        accuracy_score(y_tar, med_vote_pre) * 100,
-        accuracy_score(y_tar, sml_vote_pre) * 100
+        accuracy_score(y_tar, med_vote_pre)  * 100,
+        accuracy_score(y_tar, sml_vote_pre)  * 100
     ]
+
+    # — log overall ensembles —
+    logger.info(
+        f"Ensemble TTA:    MeanProb={acc_tta[0]:.2f}%, "
+        f"MedianProb={acc_tta[1]:.2f}%, SML={acc_tta[2]:.2f}%"
+    )
+    args.log.record(
+        f"Ensemble TTA:    MeanProb={acc_tta[0]:.2f}%, "
+        f"MedianProb={acc_tta[1]:.2f}%, SML={acc_tta[2]:.2f}%"
+    )
     logger.info(
         f"Ensemble Pre-TTA: MeanProb={acc_pre_ens[0]:.2f}%, "
         f"MedianProb={acc_pre_ens[1]:.2f}%, SML={acc_pre_ens[2]:.2f}%"
@@ -776,43 +827,41 @@ def run_subject(args, idt, files, subject_names, seeds):
         f"MedianProb={acc_pre_ens[1]:.2f}%, SML={acc_pre_ens[2]:.2f}%"
     )
 
-    # per‐session breakdown (TTA only, can mirror for Pre if desired)
+    # — **now** log per-session breakdowns —
     sess_tta_break = []
-    for idx, (s_idx, e_idx) in enumerate(getattr(args, 'tar_bounds', [])):
-        sess_name = args.session_names[idx]
-        subp = preds_tta[:, s_idx:e_idx]
-        suby = y_tar[s_idx:e_idx]
-        votes = [
-            accuracy_score(suby, (subp.mean(0)>0.5).astype(int)) * 100,
-            accuracy_score(suby, (np.median(subp,0)>0.5).astype(int)) * 100,
-            accuracy_score(suby, SML(subp)) * 100
-        ]
-        logger.info(f"  TTA {sess_name}: Mean={votes[0]:.2f}%, Median={votes[1]:.2f}%, SML={votes[2]:.2f}%")
-        args.log.record(f"  TTA {sess_name}: Mean={votes[0]:.2f}%, Median={votes[1]:.2f}%, SML={votes[2]:.2f}%")
-        sess_tta_break.append([sess_name] + votes)
-
-    # ←── new: pre-TTA session breakdown ──→
     sess_pre_break = []
-    
     for idx, (s_idx, e_idx) in enumerate(getattr(args, 'tar_bounds', [])):
-        sess_name = args.session_names[idx]
-        subp_pre = preds_pre[:, s_idx:e_idx]
-        suby     = y_tar[s_idx:e_idx]
-        votes_pre = [
-            accuracy_score(suby, (subp_pre.mean(0)>0.5).astype(int)) * 100,
-            accuracy_score(suby, (np.median(subp_pre,0)>0.5).astype(int)) * 100,
-            # use untransposed subp_pre as SML expects (members × samples)
-            accuracy_score(suby, SML(subp_pre)) * 100
+        sess = args.session_names[idx]
+        subp_t = preds_tta[:, s_idx:e_idx]; suby = y_tar[s_idx:e_idx]
+        votes_t = [
+            accuracy_score(suby, (subp_t.mean(0)>0.5).astype(int))*100,
+            accuracy_score(suby, (np.median(subp_t,0)>0.5).astype(int))*100,
+            accuracy_score(suby, SML(subp_t))*100
         ]
-        logger.info(f"  Pre-TTA {sess_name}: Mean={votes_pre[0]:.2f}%, Median={votes_pre[1]:.2f}%, SML={votes_pre[2]:.2f}%")
-        args.log.record(f"  Pre-TTA {sess_name}: Mean={votes_pre[0]:.2f}%, Median={votes_pre[1]:.2f}%, SML={votes_pre[2]:.2f}%")
-        sess_pre_break.append([sess_name] + votes_pre)
+        sess_tta_break.append([sess] + votes_t)
+        logger.info(f"TTA session {sess}: Mean={votes_t[0]:.2f}%, "
+                    f"Median={votes_t[1]:.2f}%, SML={votes_t[2]:.2f}%")
+        args.log.record(f"TTA session {sess}: Mean={votes_t[0]:.2f}%, "
+                        f"Median={votes_t[1]:.2f}%, SML={votes_t[2]:.2f}%")
 
-    # ←── updated return signature ──→
+        subp_p = preds_pre[:, s_idx:e_idx]
+        votes_p = [
+            accuracy_score(suby, (subp_p.mean(0)>0.5).astype(int))*100,
+            accuracy_score(suby, (np.median(subp_p,0)>0.5).astype(int))*100,
+            accuracy_score(suby, SML(subp_p))*100
+        ]
+        sess_pre_break.append([sess] + votes_p)
+        logger.info(f"Pre-TTA session {sess}: Mean={votes_p[0]:.2f}%, "
+                    f"Median={votes_p[1]:.2f}%, SML={votes_p[2]:.2f}%")
+        args.log.record(f"Pre-TTA session {sess}: Mean={votes_p[0]:.2f}%, "
+                        f"Median={votes_p[1]:.2f}%, SML={votes_p[2]:.2f}%")
+
     return total_tta, total_pre, acc_tta, acc_pre_ens, sess_tta_break, sess_pre_break
 
 
-def build_and_save_results(args, total_tta, total_pre,
+
+def build_and_save_results(args,
+                           total_tta, total_pre,
                            ens_tta_list, ens_pre_list,
                            session_tta_breaks, session_pre_breaks):
     overall = {
@@ -835,7 +884,7 @@ def build_and_save_results(args, total_tta, total_pre,
             'median_prob': float(ens_tta_arr[:, 1].mean()),
             'sml':         float(ens_tta_arr[:, 2].mean())
         },
-        'pre_tta': {                          # ← added pre‐TTA summary
+        'pre_tta': {
             'mean_prob':   float(ens_pre_arr[:, 0].mean()),
             'median_prob': float(ens_pre_arr[:, 1].mean()),
             'sml':         float(ens_pre_arr[:, 2].mean())
@@ -851,9 +900,10 @@ def build_and_save_results(args, total_tta, total_pre,
         'overall': overall,
         'ensemble': ensemble,
         'session_tta_breakdowns':     session_tta_breaks,
-        'session_pre_tta_breakdowns': session_pre_breaks  # ← new
+        'session_pre_tta_breakdowns': session_pre_breaks
     }
 
+    # drop un-serializable items
     for k in ['mi_data_loaded', 'log', 'out_file']:
         result['hyperparams'].pop(k, None)
 
@@ -862,10 +912,14 @@ def build_and_save_results(args, total_tta, total_pre,
         f"results_mtta{args.max_tta}_str{args.stride}_t{args.t}"
         f"_lr{args.lr}_st{args.steps}.json"
     )
-    with open(path, 'w') as jf:
-        json.dump(result, jf, indent=2)
+    with open(path, 'w', encoding='utf-8') as jf:
+        json.dump(result, jf, default=lambda o: str(o), indent=2)
         jf.flush(); os.fsync(jf.fileno())
+
     logger.info(f"Saved structured results to {path}")
+    args.log.record(f"Saved structured results to {path}")
+
+
 
 
 def main():
@@ -879,7 +933,7 @@ def main():
         base_args = build_base_args(
             data_name, paradigm, N, chn, class_num, tsn, sr, tn, fdd
         )
-        seeds = [2,3,5,6,7,8,9,11,12]
+        seeds = [2,3,5,6,7,8,9,12]
 
         for hp_values in product(*grid.values()):
             hp = dict(zip(grid.keys(), hp_values))
