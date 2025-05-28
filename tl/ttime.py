@@ -5,29 +5,27 @@
 import numpy as np
 import argparse 
 import copy
-
-import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import pandas as pd
-import csv
 from utils.network import backbone_net
 from utils.LogRecord import LogRecord
 from utils.dataloader import read_mi_combine_tar
 from utils.utils import fix_random_seed, cal_acc_comb, data_loader, cal_auc_comb, cal_score_online
-from utils.alg_utils import EA, EA_online
-from scipy.linalg import fractional_matrix_power
+from utils.alg_utils import EA_online
 from utils.loss import Entropy
-from sklearn.metrics import roc_auc_score, accuracy_score, roc_curve
+from sklearn.metrics import roc_auc_score, accuracy_score
 from ttime_ensemble import SML                # << add this import
 import torch.linalg as LA
-
-import gc
+import json
+from itertools import product
 import sys
 import time
 from torch.utils.data import DataLoader, TensorDataset
 import logging
+import os                                 # <— ensure os is imported for fsync
+import scipy.stats as stats
 
 # ── Logger setup ──────────────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
@@ -36,9 +34,20 @@ _handler = logging.StreamHandler()
 _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
 logger.addHandler(_handler)
 
+# helper: reset running stats of all BatchNorm layers
+def _reset_batchnorm(m):
+    if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+        m.reset_running_stats()
+
 # Add once: prepare_loader helper to avoid recreating DataLoader inline
-def prepare_loader(data, targets, batch_size):
-    return DataLoader(TensorDataset(data, targets), batch_size=batch_size, shuffle=False)
+def prepare_loader(data, targets, batch_size, num_workers=8, pin_memory=True):
+    return DataLoader(
+        TensorDataset(data, targets),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory
+    )
 
 def TTIME(loader, model, args, balanced=True):
     # "T-TIME: Test-Time Information Maximization Ensemble for Plug-and-Play BCIs"
@@ -63,19 +72,14 @@ def TTIME(loader, model, args, balanced=True):
         zk_arrs = np.zeros(2)
         c = 4
 
-    iter_test = iter(loader)
-
     # Initialize data_cum before the loop
     data_cum = None
-    # loop through test data stream one by one
-    for i in range(len(loader)):
+    # loop through test data stream one by one using native DataLoader iteration
+    for i, (inputs, labels) in enumerate(loader):
         #################### Phase 1: target label prediction ####################
         # time data loading & prep
         dl_start = time.time()
         model.eval()
-        data = next(iter_test)
-        # inputs→data_cum→sample_test prep
-        inputs, labels = data[0], data[1]
         inputs = inputs.reshape(1,1,inputs.shape[-2],inputs.shape[-1]).to(args.device)
 
         # accumulate test data ON‐DEVICE (no .cpu())
@@ -106,22 +110,27 @@ def TTIME(loader, model, args, balanced=True):
             # reshape into batch
             sample_test = sample_tensor.reshape(1,1,args.chn,args.time_sample_num)
             # log EA time
-            torch.cuda.synchronize() if args.device.type=='cuda' else None
-            ea_ms = (time.time() - ea_start)*1000
-            logger.debug(f"[T-TIME] iter {i}: EA_online + transform took {ea_ms:.1f} ms")
+            if args.calc_time:
+                torch.cuda.synchronize() if args.device.type=='cuda' else None
+                ea_ms = (time.time() - ea_start)*1000
+                logger.debug(f"[T-TIME] iter {i}: EA_online + transform took {ea_ms:.1f} ms")
         else:
             # no alignment: just slice ON‐DEVICE
             sample_test = data_cum[i].unsqueeze(0)  # now (1,1,chn,time)
 
         # ensure tensor is float32 on correct device
         sample_test = sample_test.to(device=args.device, dtype=torch.float32)
-        # log data‐loading & prep time
-        dl_ms = (time.time() - dl_start)*1000
-        logger.debug(f"[T-TIME] iter {i}: data load & prep took {dl_ms:.1f} ms")
 
-        _, outputs = model(sample_test)
+        # --- Phase 1 inference (no grad) ---------------------------
+        with torch.no_grad():
+            _, outputs = model(sample_test)
+
+        if args.calc_time:
+            dl_ms = (time.time() - dl_start)*1000
+            logger.debug(f"[T-TIME] iter {i}: data load & prep took {dl_ms:.1f} ms")
 
         softmax_out = nn.Softmax(dim=1)(outputs)
+
         outputs = outputs.float().cpu()
         labels = labels.float().cpu()
         _, predict = torch.max(outputs, 1)
@@ -168,9 +177,10 @@ def TTIME(loader, model, args, balanced=True):
                 sqrtRefEA_w = evec_w @ torch.diag(ev_w.pow(-0.5)) @ evec_w.T
                 # align entire batch on GPU
                 aligned = torch.einsum('ij,bjt->bit', sqrtRefEA_w, flat.to(args.device))
-                torch.cuda.synchronize() if args.device.type=='cuda' else None
-                align_ms = (time.time() - align_start) * 1000
-                logger.debug(f"[T-TIME] iter {i}: alignment took {align_ms:.1f} ms")
+                if args.calc_time:
+                    torch.cuda.synchronize() if args.device.type=='cuda' else None
+                    align_ms = (time.time() - align_start) * 1000
+                    logger.debug(f"[T-TIME] iter {i}: alignment took {align_ms:.1f} ms")
                 batch_test = aligned.unsqueeze(1)    # (win,1,chn,time)
             else:
                 # slice last win samples and move to CPU for numpy
@@ -183,14 +193,17 @@ def TTIME(loader, model, args, balanced=True):
                 batch_test = torch.from_numpy(batch_test)
             batch_test = batch_test.to(device=args.device, dtype=torch.float32)
 
-            start_time = time.time()
             for step in range(args.steps):
-                # forward timing
-                fwd_start = time.time()
+                if args.calc_time:
+                    opt_start = time.time()
+                optimizer.zero_grad()
+                if args.calc_time:
+                    fwd_start = time.time()
                 _, outputs = model(batch_test)
-                torch.cuda.synchronize() if args.device.type=='cuda' else None
-                fwd_ms = (time.time() - fwd_start) * 1000
-                logger.debug(f"[T-TIME] iter {i}, step {step}: forward {fwd_ms:.1f} ms")
+                if args.calc_time:
+                    torch.cuda.synchronize() if args.device.type=='cuda' else None
+                    fwd_ms = (time.time() - fwd_start) * 1000
+                    logger.debug(f"[T-TIME] iter {i}, step {step}: forward {fwd_ms:.1f} ms")
 
                 args.epsilon = 1e-5
                 softmax_out = nn.Softmax(dim=1)(outputs / args.t)
@@ -212,14 +225,12 @@ def TTIME(loader, model, args, balanced=True):
                     AMDR_loss = torch.sum(normed_qk * torch.log(normed_qk + args.epsilon))
                     loss = CEM_loss + AMDR_loss
 
-                # backward + step timing
-                opt_start = time.time()
-                optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                torch.cuda.synchronize() if args.device.type=='cuda' else None
-                opt_ms = (time.time() - opt_start) * 1000
-                logger.debug(f"[T-TIME] iter {i}, step {step}: backward+opt {opt_ms:.1f} ms")
+                if args.calc_time:
+                    torch.cuda.synchronize() if args.device.type=='cuda' else None
+                    opt_ms = (time.time() - opt_start) * 1000
+                    logger.debug(f"[T-TIME] iter {i}, step {step}: backward+opt {opt_ms:.1f} ms")
 
             TTA_time = time.time()
             if args.calc_time:
@@ -240,17 +251,11 @@ def TTIME(loader, model, args, balanced=True):
         model.eval()
 
     if balanced:
-        # binary case: calibrate threshold via Youden’s J
+        # binary case: use fixed threshold (args.pre_thresh or default 0.5)
         if args.class_num == 2:
-            # extract positive-class scores
             y_scores = np.array(y_pred).reshape(-1, args.class_num)[:, 1]
-            # compute ROC curve
-            fpr, tpr, thresholds = roc_curve(y_true, y_scores)
-            # Youden’s J statistic
-            optimal_idx = np.argmax(tpr - fpr)
-            best_thresh = thresholds[optimal_idx]
-            # apply best threshold
-            preds = (y_scores > best_thresh).astype(int)
+            thresh = getattr(args, 'pre_thresh', 0.5)
+            preds = (y_scores > thresh).astype(int)
             score = accuracy_score(y_true, preds)
         else:
             # multiclass: default argmax
@@ -288,16 +293,11 @@ def train_target(args):
     os.makedirs(os.path.join('.', 'runs', args.data_name), exist_ok=True)
     os.makedirs(args.result_dir, exist_ok=True)
 
-    # load source/target
-    # load source/target only once per subject
-    if not hasattr(args, 'mi_data_loaded'):
-        args.mi_data_loaded = read_mi_combine_tar(args)
-    X_src, y_src, X_tar, y_tar = args.mi_data_loaded
+    # always load fresh source/target data for current subject
+    X_src, y_src, X_tar, y_tar = read_mi_combine_tar(args)
 
-    # build / cache data loaders with EA applied only once per subject
-    if not hasattr(args, 'dset_loaders_cached'):
-        args.dset_loaders_cached = data_loader(X_src, y_src, X_tar, y_tar, args)
-    dset_loaders = args.dset_loaders_cached
+    # build data loaders for current subject without caching
+    dset_loaders = data_loader(X_src, y_src, X_tar, y_tar, args)
 
     # build per-session bounds for CustomEpoch
     if args.data == 'CustomEpoch':
@@ -321,7 +321,17 @@ def train_target(args):
     if args.max_epoch == 0:
         # load pretrained source‐model checkpoint for fair comparison
         best_ckpt = f'./runs/{args.data_name}/{args.backbone}_S{idt_str}_seed{args.SEED}{extra_string}_best.ckpt'
+        # verify filename encodes current target sessions
+        expected = f"_S{idt_str}_"
+        if expected not in best_ckpt:
+            logger.error(f"Checkpoint filename '{best_ckpt}' does not match target sessions {args.idt}")
+            sys.exit(1)
+        logger.debug(f"[DEBUG] Loading pretrained source-model checkpoint: {best_ckpt}")
+        if not os.path.isfile(best_ckpt):
+            logger.warning(f"[WARNING] Pretrained checkpoint not found: {best_ckpt}")
         base_network.load_state_dict(torch.load(best_ckpt, map_location=args.device))
+        # WARNING: confirm loaded model excludes any target-session data
+        logger.info   (f"[CONFIRM] Loaded source model '{best_ckpt}' excludes target sessions {args.idt}")
         base_network.eval()
 
         # unify metric: use online streaming scoring on the same split
@@ -340,30 +350,43 @@ def train_target(args):
         )
         # PRE‐TTA inference (no adaptation)
         src_model = copy.deepcopy(base_network).to(args.device).eval()
+        # initialize EA reference for pre-TTA
+        R = 0 if args.align else None
         pre_y_pred = []
         with torch.no_grad():
-            for x, _ in loader_pre:
+            for i, (x, _) in enumerate(loader_pre):
                 x = x.to(args.device).float()
                 if 'EEGNet' in args.backbone:
                     x = x.unsqueeze(3).permute(0,3,1,2)
+                if args.align:
+                    # update & apply EA whitening per sample
+                    sample = x.squeeze(0).squeeze(0)               # (chn, time)
+                    sample_np = sample.cpu().numpy()
+                    R = EA_online(sample_np, R, i)
+                    R += np.eye(R.shape[0]) * 1e-6
+                    R_t = torch.from_numpy(R).to(device=args.device, dtype=sample.dtype)
+                    ev, evec = LA.eigh(R_t)
+                    sqrtRefEA = evec @ torch.diag(ev.pow(-0.5)) @ evec.T
+                    sample = sqrtRefEA @ sample
+                    x = sample.reshape(1,1,args.chn,args.time_sample_num)
                 _, logits = src_model(x)
                 soft = nn.Softmax(dim=1)(logits)
                 pre_y_pred.append(soft.cpu().numpy())
         pre_y_pred = np.concatenate(pre_y_pred, axis=0)
+        # current: saves both class‐0 and class‐1 probs shape (n_samples,2)
+        # np.savetxt(os.path.join(args.result_dir,
+        #            f"{args.data_name}_T-TIME_seed_{args.SEED}_pre_probs.csv"),
+        #           pre_y_pred, delimiter=",")
+        # replace with only the positive‐class probs:
+        pos_probs = pre_y_pred[:, 1]
         np.savetxt(os.path.join(args.result_dir,
-                    f"{args.data_name}_T-TIME_seed_{args.SEED}_pre_probs.csv"),
-                   pre_y_pred, delimiter=",")
-        # --- calibrate Pre-TTA threshold via Youden's J for binary balanced setting ---
-        if args.class_num == 2 and args.balanced:
-            # use ground-truth y_tar from this scope
-            fpr, tpr, th = roc_curve(y_tar, pre_y_pred[:,1])
-            best_pre_thresh = th[np.argmax(tpr - fpr)]
-            args.pre_thresh = float(best_pre_thresh)
-            logger.info(f"Calibrated Pre-TTA threshold: {best_pre_thresh:.3f}")
-            if hasattr(args, 'log'):
-                args.log.record(f"Calibrated Pre-TTA threshold: {best_pre_thresh:.3f}")
+                   f"{args.data_name}_T-TIME_seed_{args.SEED}_pre_probs.csv"),
+                   pos_probs, delimiter=",")
+        # use fixed threshold for Pre-TTA
+        args.pre_thresh = 0.5
         # POST-TTA streaming adaptation
         adapted_model = copy.deepcopy(base_network).to(args.device)
+        adapted_model.apply(_reset_batchnorm)           # <<< reset BN stats
         tta_score, tta_y_pred, _ = TTIME(loader_pre, adapted_model, args=args, balanced=args.balanced)
         np.savetxt(os.path.join(args.result_dir,
                     f"{args.data_name}_T-TIME_seed_{args.SEED}_tta_probs.csv"),
@@ -436,6 +459,8 @@ def train_target(args):
 
         # load the best model (not the last one) before any further evaluation
         base_network.load_state_dict(torch.load(best_ckpt, map_location=args.device))
+        # WARNING: confirm loaded model excludes any target-session data
+        logger.info   (f"[CONFIRM] Loaded best model '{best_ckpt}' excludes target sessions {args.idt}")
 
         # global pre-TTA IEA
         pre_score = cal_score_online(dset_loaders["Target-Online"], base_network, args=args)
@@ -456,30 +481,43 @@ def train_target(args):
         )
         # PRE‐TTA inference (no adaptation)
         src_model = copy.deepcopy(base_network).to(args.device).eval()
+        # initialize EA reference for pre-TTA
+        R = 0 if args.align else None
         pre_y_pred = []
         with torch.no_grad():
-            for x, _ in loader_pre:
+            for i, (x, _) in enumerate(loader_pre):
                 x = x.to(args.device).float()
                 if 'EEGNet' in args.backbone:
                     x = x.unsqueeze(3).permute(0,3,1,2)
+                if args.align:
+                    # update & apply EA whitening per sample
+                    sample = x.squeeze(0).squeeze(0)               # (chn, time)
+                    sample_np = sample.cpu().numpy()
+                    R = EA_online(sample_np, R, i)
+                    R += np.eye(R.shape[0]) * 1e-6
+                    R_t = torch.from_numpy(R).to(device=args.device, dtype=sample.dtype)
+                    ev, evec = LA.eigh(R_t)
+                    sqrtRefEA = evec @ torch.diag(ev.pow(-0.5)) @ evec.T
+                    sample = sqrtRefEA @ sample
+                    x = sample.reshape(1,1,args.chn,args.time_sample_num)
                 _, logits = src_model(x)
                 soft = nn.Softmax(dim=1)(logits)
                 pre_y_pred.append(soft.cpu().numpy())
         pre_y_pred = np.concatenate(pre_y_pred, axis=0)
+        # current: saves both class‐0 and class‐1 probs shape (n_samples,2)
+        # np.savetxt(os.path.join(args.result_dir,
+        #            f"{args.data_name}_T-TIME_seed_{args.SEED}_pre_probs.csv"),
+        #           pre_y_pred, delimiter=",")
+        # replace with only the positive‐class probs:
+        pos_probs = pre_y_pred[:, 1]
         np.savetxt(os.path.join(args.result_dir,
-                    f"{args.data_name}_T-TIME_seed_{args.SEED}_pre_probs.csv"),
-                   pre_y_pred, delimiter=",")
-        # --- calibrate Pre-TTA threshold via Youden's J for binary balanced setting ---
-        if args.class_num == 2 and args.balanced:
-            # use ground-truth y_tar from this scope
-            fpr, tpr, th = roc_curve(y_tar, pre_y_pred[:,1])
-            best_pre_thresh = th[np.argmax(tpr - fpr)]
-            args.pre_thresh = float(best_pre_thresh)
-            logger.info(f"Calibrated Pre-TTA threshold: {best_pre_thresh:.3f}")
-            if hasattr(args, 'log'):
-                args.log.record(f"Calibrated Pre-TTA threshold: {best_pre_thresh:.3f}")
+                   f"{args.data_name}_T-TIME_seed_{args.SEED}_pre_probs.csv"),
+                   pos_probs, delimiter=",")
+        # use fixed threshold for Pre-TTA
+        args.pre_thresh = 0.5
         # POST-TTA streaming adaptation
         adapted_model = copy.deepcopy(base_network).to(args.device)
+        adapted_model.apply(_reset_batchnorm)           # <<< reset BN stats
         tta_score, tta_y_pred, _ = TTIME(loader_pre, adapted_model, args=args, balanced=args.balanced)
         np.savetxt(os.path.join(args.result_dir,
                     f"{args.data_name}_T-TIME_seed_{args.SEED}_tta_probs.csv"),
@@ -489,357 +527,401 @@ def train_target(args):
         return tta_score, pre_acc
 
 
-if __name__ == '__main__':
 
-    data_name_list = ['CustomEpoch']
-
-    # load session filenames and extract prefixes as in dnn.py
-    df_meta = pd.read_csv('./data/CustomEpoch/meta.csv')
-    # files list from df_meta (‘file’ column, full filenames)
+def load_metadata(data_name):
+    meta_path = f'./data/{data_name}/meta.csv'
+    df_meta = pd.read_csv(meta_path)
     files = df_meta['file'].tolist()
-    prefixes = sorted({f.split('_')[0] for f in files})
-    subject_names = prefixes
-
-    # prepare result columns for each prefix
-    sess_cols = [f's{i}' for i in range(len(subject_names))]
-    dct = pd.DataFrame(columns=['dataset','avg','std'] + sess_cols)
-
-    for data_name in data_name_list:
-        # N: number of subjects, chn: number of channels
-        if data_name == 'BNCI2014001':
-            paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 9, 22, 2, 1001, 250, 144, 248
-        elif data_name == 'BNCI2014002':
-            paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 14, 15, 2, 2561, 512, 100, 640
-        elif data_name == 'BNCI2015001':
-            paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim = 'MI', 12, 13, 2, 2561, 512, 200, 640
-        elif data_name == 'CustomEpoch':
-            paradigm = 'MI'
-            N = len(subject_names)  # number of unique prefixes/sessions
-            chn, class_num, time_sample_num, sample_rate = 31, 2, 1515, 200
-            # F2 * (time_sample_num // 32)
-            feature_deep_dim = 1504
-            # use actual total trials across all sessions
-            import pandas as _pd
-            trial_num = int(_pd.read_csv('./data/CustomEpoch/meta.csv')['n_trials'].sum())
-        else:
-            raise ValueError(f"Unknown data_name {data_name}")
-
-        # ── Define hyperparameter grid ─────────────────────────────────
-        max_tta_list = [6, 8, 10, 12, 16]
-        stride_list  = [1, 2, 3, 4]
-        t_list       = [1.3, 1.5, 1.7, 1.8, 1.9, 2.0, 2.2]
-        lr_list      = [0.0001, 0.0005, 0.001]
-        steps_list   = [1, 3, 5, 7, 9, 11]
-
-        align = True
-
-        use_pretrained_model = True  # keep existing behavior
-
-        # ── Hyperparameter search loops ───────────────────────────────
-        for max_tta in max_tta_list:
-            for stride in stride_list:
-                for t in t_list:
-                    for lr in lr_list:
-                        for steps in steps_list:
-                            # set training epochs
-                            max_epoch = 0 if use_pretrained_model else 30
-                            balanced   = True
-                            calc_time  = False
-                            # build args for this combination
-                            args = argparse.Namespace(
-                                feature_deep_dim=feature_deep_dim,
-                                align=align,
-                                lr=lr,
-                                t=t,
-                                max_epoch=max_epoch,
-                                trial_num=trial_num,
-                                time_sample_num=time_sample_num,
-                                sample_rate=sample_rate,
-                                N=N,
-                                chn=chn,
-                                class_num=class_num,
-                                stride=stride,
-                                steps=steps,
-                                calc_time=calc_time,
-                                paradigm=paradigm,
-                                max_tta=max_tta,
-                                data_name=data_name,
-                                balanced=balanced
-                            )
-                            args.print_trial_details = False
-                            args.method    = 'T-TIME'
-                            args.backbone  = 'EEGNet'
-                            args.batch_size= 128
-                            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-                            args.device    = device
-                            args.data_env  = 'gpu' if torch.cuda.is_available() else 'local'
-                            args.data      = data_name
-                            args.local_dir = './data/' + str(data_name) + '/'
-                            # override result_dir per hyperparameter combo
-                            args.result_dir = (
-                                f'./logs/{data_name}/'
-                                f'mtta{max_tta}_str{stride}_t{t}_lr{lr}_st{steps}/'
-                            )
-                            os.makedirs(args.result_dir, exist_ok=True)
-
-                            # create a dedicated log file for this hyper‐parameter run
-                            log_name = f"log_T-TIME_{data_name}_mtta{max_tta}_str{stride}_t{t}_lr{lr}_st{steps}.txt"
-                            log_path = os.path.join(args.result_dir, log_name)
-                            args.out_file = open(log_path, 'w', encoding='utf-8')
-
-                            # ── existing initialization of logging, seeds, storage... ──
-                            my_log = LogRecord(args)
-                            my_log.log_init()
-                            args.log = my_log
-                            # ADD file handler to capture DEBUG timing into same log file
-                            file_handler = logging.FileHandler(args.out_file.name)
-                            file_handler.setLevel(logging.DEBUG)
-                            file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-                            logger.addHandler(file_handler)
-
-                            # log and record the hyperparameter combination
-                            combo_str = (
-                                f"Running hyperparameters: "
-                                f"max_tta={max_tta}, stride={stride}, t={t}, lr={lr}, steps={steps}"
-                            )
-                            logger.info(combo_str)
-                            args.log.record(combo_str)
-
-                            seeds = [2, 3, 5, 6,7,8,9,11,12]
-                            total_acc = np.zeros((len(seeds), N))
-                            pre_acc_all_seeds = np.zeros((len(seeds), N))
-                            ensemble_tta_all = []
-                            ensemble_pre_all = []
-                            session_tta_breakdowns = []   # store per‐subject session‐wise TTA breakdown
-                            session_pre_breakdowns = []   # store per‐subject session‐wise Pre‐TTA breakdown
-
-                            # Iterate through each subject first
-                            for idt in range(N):
-                                # collect all session indices belonging to this subject prefix
-                                target_str = subject_names[idt]
-                                idts = [i for i, fn in enumerate(files) if fn.split('_')[0] == target_str]
-                                args.idt = idts
-                                # Pre-load and cache subject data once per subject iteration
-                                if not hasattr(args, 'mi_data_loaded'):
-                                    args.mi_data_loaded = read_mi_combine_tar(args)
-                                else:
-                                    # refresh cache for the changed subject idt
-                                    args.mi_data_loaded = read_mi_combine_tar(args)
-                                # use prefix names
-                                others = subject_names.copy()
-                                others.pop(idt)
-                                source_str = 'Except_' + '_'.join(others)
-                                args.task_str = source_str + '_2_' + target_str
-                                
-                                info_str = '\n========================== Transfer to ' + target_str + ' =========================='
-                                logger.info(info_str)
-                                args.log.record(info_str)
-                                
-                                # Now run all seeds for this subject
-                                for seed_idx, s in enumerate(seeds):
-                                    args.SEED = s
-                                    logger.info(f"--- Running Subject {target_str} with Seed {s} ---")
-                                    args.log.record(f"--- Running Subject {target_str} with Seed {s} ---")
-
-                                    fix_random_seed(args.SEED)
-                                    torch.backends.cudnn.deterministic = True
-
-                                    args.data = data_name
-                                    logger.info(f"Data: {args.data}, Method: {args.method}, Seed: {args.SEED}")
-                                    args.log.record(f"Data: {args.data}, Method: {args.method}, Seed: {args.SEED}")
-
-                                    # Run training and evaluation for this subject and seed
-                                    tta_acc, pre_acc = train_target(args)
-                                    
-                                    # Store results
-                                    total_acc[seed_idx, idt] = tta_acc
-                                    pre_acc_all_seeds[seed_idx, idt] = pre_acc
-
-                                    # Log results for this subject and seed
-                                    logger.info(f"Subject {target_str} with Seed {s} - TTA Acc: {tta_acc:.3f}, Pre-TTA: {pre_acc:.3f}")
-                                    args.log.record(f"Subject {target_str} with Seed {s} - TTA Acc: {tta_acc:.3f}, Pre-TTA: {pre_acc:.3f}")
-                                    
-                                    # Save per-seed, per-subject results
-                                    np.savetxt(
-                                        os.path.join(args.result_dir, f"{data_name}_T-TIME_seed_{args.SEED}_subject_{idt}_acc.csv"),
-                                        np.array([tta_acc, pre_acc]), delimiter=","
-                                    )
-                                    
-                                    # Clear GPU memory between seeds
-                                    if torch.cuda.is_available():
-                                        torch.cuda.empty_cache()
-                                
-                                # After all seeds for this subject, print summary for this subject
-                                subject_mean_tta = np.mean(total_acc[:, idt])
-                                subject_std_tta = np.std(total_acc[:, idt])
-                                subject_mean_pre = np.mean(pre_acc_all_seeds[:, idt])
-                                subject_std_pre = np.std(pre_acc_all_seeds[:, idt])
-
-                                # Calculate 95% confidence intervals (for small sample sizes using t-distribution)
-                                from scipy import stats
-                                n_seeds = len(seeds)
-                                confidence = 0.95
-                                # t-value for 95% confidence with n-1 degrees of freedom
-                                t_val = stats.t.ppf((1 + confidence) / 2, n_seeds - 1)
-                                ci_tta = t_val * (subject_std_tta / np.sqrt(n_seeds))
-                                ci_pre = t_val * (subject_std_pre / np.sqrt(n_seeds))
-                                
-                                logger.info(f"=== Subject {target_str} Summary Across All Seeds ===")
-                                logger.info(f"TTA Accuracy: {subject_mean_tta:.3f} ± {subject_std_tta:.3f} (95% CI: {subject_mean_tta-ci_tta:.3f} to {subject_mean_tta+ci_tta:.3f})")
-                                logger.info(f"Pre-TTA Accuracy: {subject_mean_pre:.3f} ± {subject_std_pre:.3f} (95% CI: {subject_mean_pre-ci_pre:.3f} to {subject_mean_pre+ci_pre:.3f})")
-                                args.log.record(f"TTA Accuracy: {subject_mean_tta:.3f} ± {subject_std_tta:.3f} (95% CI: {subject_mean_tta-ci_tta:.3f} to {subject_mean_tta+ci_tta:.3f})")
-                                args.log.record(f"Pre-TTA Accuracy: {subject_mean_pre:.3f} ± {subject_std_pre:.3f} (95% CI: {subject_mean_pre-ci_pre:.3f} to {subject_mean_pre+ci_pre:.3f})")
-
-                                # Ensemble evaluation across seeds for this subject
-                                # reload target labels for this subject
-                                _, _, X_tar_sub, y_tar_sub = args.mi_data_loaded
-
-                                preds_seeds = []
-                                for s in seeds:
-                                    pred_file = os.path.join(
-                                        args.result_dir,
-                                        f"{args.data_name}_T-TIME_seed_{s}_tta_probs.csv"  # load post-adaptation probs
-                                    )
-                                    # load TTA probs
-                                    flat = []
-                                    with open(pred_file, 'r') as fr:
-                                        for line in fr:
-                                            parts = line.strip().split(',')
-                                            flat.extend([float(x) for x in parts if x])
-                                    preds_seeds.append(np.array(flat))
-                                preds_arr = np.stack(preds_seeds, axis=0)  # now shape (n_seeds, n_trials)
-
-                                # 1) Majority‐vote on hard labels
-                                labels = (preds_arr > 0.5).astype(int)
-                                maj_vote = (labels.sum(axis=0) >= (len(seeds)/2)).astype(int)
-                                acc_maj = accuracy_score(y_tar_sub, maj_vote) * 100
-
-                                # 2) Mean probability decision
-                                mean_prob = preds_arr.mean(axis=0)
-                                mean_vote = (mean_prob > 0.5).astype(int)
-                                acc_mean = accuracy_score(y_tar_sub, mean_vote) * 100
-
-                                # 3) Median probability decision
-                                med_prob = np.median(preds_arr, axis=0)
-                                med_vote = (med_prob > 0.5).astype(int)
-                                acc_med = accuracy_score(y_tar_sub, med_vote) * 100
-
-                                # 4) SML‐based ensemble
-                                sml_pred = SML(preds_arr)
-                                acc_sml = accuracy_score(y_tar_sub, sml_pred) * 100
-
-                                # report ensemble results (no majority vote)
-                                logger.info(f"Ensemble TTA: MeanProb={acc_mean:.2f}%, MedianProb={acc_med:.2f}%, SML={acc_sml:.2f}%")
-                                args.log.record(f"Ensemble TTA: MeanProb={acc_mean:.2f}%, MedianProb={acc_med:.2f}%, SML={acc_sml:.2f}%")
-                                ensemble_tta_all.append([acc_mean, acc_med, acc_sml])
-                                # session‐wise TTA breakdown
-                                sess_tta = []
-                                for idx, (s, e) in enumerate(getattr(args, 'tar_bounds', [])):
-                                    sess_name = args.session_names[idx]
-                                    sub_preds = preds_arr[:, s:e]
-                                    sub_labels = y_tar_sub[s:e]
-                                    maj_vote       = (sub_preds > 0.5).sum(axis=0) >= (len(seeds)/2)
-                                    mean_prob      = sub_preds.mean(axis=0) > 0.5
-                                    med_prob       = np.median(sub_preds, axis=0) > 0.5
-                                    sml_pred       = SML(sub_preds)
-                                    acc_maj_s      = accuracy_score(sub_labels, maj_vote) * 100
-                                    acc_mean_s     = accuracy_score(sub_labels, mean_prob) * 100
-                                    acc_med_s      = accuracy_score(sub_labels, med_prob) * 100
-                                    acc_sml_s      = accuracy_score(sub_labels, sml_pred) * 100
-                                    logger.info(f"   Session {sess_name} Ensemble TTA breakdown: Maj={acc_maj_s:.2f}%, Mean={acc_mean_s:.2f}%, Median={acc_med_s:.2f}%, SML={acc_sml_s:.2f}%")
-                                    args.log.record(f"   Session {sess_name} Ensemble TTA breakdown: Maj={acc_maj_s:.2f}%, Mean={acc_mean_s:.2f}%, Median={acc_med_s:.2f}%, SML={acc_sml_s:.2f}%")
-                                    sess_tta.append([acc_maj_s, acc_mean_s, acc_med_s, acc_sml_s])
-                                session_tta_breakdowns.append((subject_names[idt], sess_tta))
-
-                                # Ensemble summary for Pre-TTA probabilities across seeds
-                                pre_list = []
-                                for s in seeds:
-                                    pp = np.loadtxt(os.path.join(args.result_dir,
-                                        f"{args.data_name}_T-TIME_seed_{s}_pre_probs.csv"), delimiter=',')
-                                    prob1 = pp[:,1] if pp.ndim>1 else pp
-                                    pre_list.append(prob1)
-                                pre_mat = np.stack(pre_list, axis=0)  # shape (n_seeds, n_trials)
-                                th = getattr(args, 'pre_thresh', 0.5)
-                                pre_labels = (pre_mat > th).astype(int)
-                                pre_maj = (pre_labels.sum(axis=0) >= (len(seeds)/2)).astype(int)
-                                acc_pre_maj = accuracy_score(y_tar_sub, pre_maj) * 100
-                                # mean & median decisions using same threshold
-                                pre_mean_vote = (pre_mat.mean(axis=0) > th).astype(int)
-                                pre_med_vote  = (np.median(pre_mat, axis=0) > th).astype(int)
-                                # compute mean/median accuracy
-                                acc_pre_mean = accuracy_score(y_tar_sub, pre_mean_vote) * 100
-                                acc_pre_med  = accuracy_score(y_tar_sub, pre_med_vote) * 100
-                                # SML on soft probabilities
-                                pre_sml = SML(pre_mat)
-                                acc_pre_sml  = accuracy_score(y_tar_sub, pre_sml) * 100
-                                logger.info(f"Ensemble Pre-TTA: Majority={acc_pre_maj:.2f}%, MeanProb={acc_pre_mean:.2f}%, MedianProb={acc_pre_med:.2f}%, SML={acc_pre_sml:.2f}")
-                                args.log.record(f"Ensemble Pre-TTA: Majority={acc_pre_maj:.2f}%, MeanProb={acc_pre_mean:.2f}%, MedianProb={acc_pre_med:.2f}%, SML={acc_pre_sml:.2f}")
-                                ensemble_pre_all.append([acc_pre_maj, acc_pre_mean, acc_pre_med, acc_pre_sml])
-                                # session‐wise Pre-TTA breakdown
-                                sess_pre = []
-                                for idx, (s, e) in enumerate(getattr(args, 'tar_bounds', [])):
-                                    sess_name = args.session_names[idx]
-                                    sub_preds_pre = pre_mat[:, s:e]
-                                    sub_labels_pre= y_tar_sub[s:e]
-                                    maj_vote_p      = (sub_preds_pre > th).sum(axis=0) >= (len(seeds)/2)
-                                    mean_prob_p     = sub_preds_pre.mean(axis=0) > th
-                                    med_prob_p      = np.median(sub_preds_pre, axis=0) > th
-                                    sml_pred_p      = SML(sub_preds_pre)
-                                    acc_maj_p_s     = accuracy_score(sub_labels_pre, maj_vote_p) * 100
-                                    acc_mean_p_s    = accuracy_score(sub_labels_pre, mean_prob_p) * 100
-                                    acc_med_p_s     = accuracy_score(sub_labels_pre, med_prob_p) * 100
-                                    acc_sml_p_s     = accuracy_score(sub_labels_pre, sml_pred_p) * 100
-                                    logger.info(f"   Session {sess_name} Ensemble Pre-TTA breakdown: Maj={acc_maj_p_s:.2f}%, Mean={acc_mean_p_s:.2f}%, Median={acc_med_p_s:.2f}%, SML={acc_sml_p_s:.2f}%")
-                                    args.log.record(f"   Session {sess_name} Ensemble Pre-TTA breakdown: Maj={acc_maj_p_s:.2f}%, Mean={acc_mean_p_s:.2f}%, Median={acc_med_p_s:.2f}%, SML={acc_sml_p_s:.2f}%")
-                                    sess_pre.append([acc_maj_p_s, acc_mean_p_s, acc_med_p_s, acc_sml_p_s])
-                                session_pre_breakdowns.append((subject_names[idt], sess_pre))
+    subject_names = sorted({f.split('_')[0] for f in files})
+    return df_meta, files, subject_names
 
 
-        # ─── Final summary across all subjects ───────────────────────────────
-        logger.info("=== Per-seed × per-subject Accuracies ===")
-        header = "Subjects: " + ", ".join(subject_names)
-        logger.info(header); args.log.record(header)
-        seed_line = "Seeds: " + ", ".join(map(str, seeds))
-        logger.info(seed_line); args.log.record(seed_line)
+def get_dataset_params(data_name, subject_names, df_meta):
+    if data_name == 'BNCI2014001':
+        return 'MI', 9, 22, 2, 1001, 250, 144, 248
+    elif data_name == 'BNCI2014002':
+        return 'MI', 14, 15, 2, 2561, 512, 100, 640
+    elif data_name == 'BNCI2015001':
+        return 'MI', 12, 13, 2, 2561, 512, 200, 640
+    elif data_name == 'CustomEpoch':
+        paradigm = 'MI'
+        N = len(subject_names)
+        chn, class_num, time_sample_num, sample_rate = 31, 2, 1515, 200
+        feature_deep_dim = 1504
+        trial_num = int(df_meta['n_trials'].sum())
+        return paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim
+    else:
+        raise ValueError(f"Unknown data_name {data_name}")
 
-        # TTA matrix
-        logger.info("TTA Accs (rows=seeds, cols=subjects):")
-        logger.info(f"{np.round(total_acc,3)}")
-        args.log.record("TTA Accs:\n" + np.array2string(np.round(total_acc, 3)))
 
-        # Pre-TTA matrix
-        logger.info("Pre-TTA Accs (rows=seeds, cols=subjects):")
-        logger.info(f"{np.round(pre_acc_all_seeds,3)}")
-        args.log.record("Pre-TTA Accs:\n" + np.array2string(np.round(pre_acc_all_seeds, 3)))
+def build_hyperparam_grid():
+    return {
+        'max_tta': [8, 10],
+        'stride':  [1, 2, 3],
+        't':       [1.5, 1.7, 1.8, 1.9, 2.0, 2.2],
+        'lr':      [0.0001, 0.0005],
+        'steps':   [1, 3, 5],
+    }
 
-        # Per-seed means
-        tta_seed_mean  = np.round(np.mean(total_acc, axis=1), 3)
-        pre_seed_mean  = np.round(np.mean(pre_acc_all_seeds, axis=1), 3)
-        logger.info("Overall per-seed means:")
-        logger.info(f"  TTA:    {tta_seed_mean}")
-        logger.info(f"  Pre-TTA: {pre_seed_mean}")
-        args.log.record(f"Overall per-seed TTA mean:  {tta_seed_mean}")
-        args.log.record(f"Overall per-seed Pre-TTA mean:  {pre_seed_mean}")
 
-        # Grand means
-        overall_tta  = np.mean(total_acc)
-        overall_pre  = np.mean(pre_acc_all_seeds)
-        summary = (
-            f"Grand Means:\n"
-            f"  Overall TTA Acc:   {overall_tta:.2f}%\n"
-            f"  Overall Pre-TTA:    {overall_pre:.2f}%"
+def build_base_args(data_name, paradigm, N, chn, class_num,
+                    time_sample_num, sample_rate, trial_num, feature_deep_dim):
+    args = argparse.Namespace()
+    args.data_name        = data_name
+    args.feature_deep_dim = feature_deep_dim
+    args.paradigm         = paradigm
+    args.N                = N
+    args.chn              = chn
+    args.class_num        = class_num
+    args.time_sample_num  = time_sample_num
+    args.sample_rate      = sample_rate
+    args.trial_num        = trial_num
+    args.print_trial_details = False
+    args.method           = 'T-TIME'
+    args.backbone         = 'EEGNet'
+    args.batch_size       = 128
+    args.align            = True
+    args.use_pretrained_model = True
+    args.balanced         = True
+    args.calc_time        = False
+    args.device           = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    args.data_env         = 'gpu' if torch.cuda.is_available() else 'local'
+    return args
+
+
+def setup_run(args, data_name, hp):
+    # hyperparams
+    args.max_tta = hp['max_tta']
+    args.stride  = hp['stride']
+    args.t       = hp['t']
+    args.lr      = hp['lr']
+    args.steps   = hp['steps']
+    # epochs
+    args.max_epoch = 0 if args.use_pretrained_model else 30
+
+    # paths
+    args.data      = data_name
+    args.local_dir = f'./data/{data_name}/'
+    args.result_dir = (
+        f'./logs/{data_name}/'
+        f'mtta{args.max_tta}_str{args.stride}_t{args.t}_lr{args.lr}_st{args.steps}/'
+    )
+    os.makedirs(args.result_dir, exist_ok=True)
+
+    # logging
+    log_name = (
+        f"log_T-TIME_{data_name}_"
+        f"mtta{args.max_tta}_str{args.stride}_t{args.t}_"
+        f"lr{args.lr}_st{args.steps}.txt"
+    )
+    log_path = os.path.join(args.result_dir, log_name)
+    args.out_file = open(log_path, 'w', encoding='utf-8')
+
+    my_log = LogRecord(args)
+    my_log.log_init()
+    args.log = my_log
+
+    # reset handlers
+    for h in logger.handlers[:]:
+        if isinstance(h, logging.FileHandler):
+            logger.removeHandler(h)
+    fh = logging.FileHandler(log_path)
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+    logger.addHandler(fh)
+
+    combo_str = (
+        f"Running hyperparameters: "
+        f"max_tta={args.max_tta}, stride={args.stride}, t={args.t}, "
+        f"lr={args.lr}, steps={args.steps}"
+    )
+    logger.info(combo_str)
+    args.log.record(combo_str)
+
+
+def run_subject(args, idt, files, subject_names, seeds):
+    target = subject_names[idt]
+    idts = [i for i, fn in enumerate(files) if fn.split('_')[0] == target]
+    args.idt = idts
+
+    # load data
+    args.mi_data_loaded = read_mi_combine_tar(args)
+
+    # naming
+    others = subject_names.copy()
+    others.pop(idt)
+    args.task_str = 'Except_' + '_'.join(others) + '_2_' + target
+
+    info = f"\n=== Transfer to {target} ==="
+    logger.info(info); args.log.record(info)
+
+    # per-seed storage
+    total_tta = np.zeros(len(seeds))
+    total_pre = np.zeros(len(seeds))
+
+    for si, s in enumerate(seeds):
+        args.SEED = s
+        logger.info(f"--- Subject {target}, Seed {s} ---")
+        args.log.record(f"--- Subject {target}, Seed {s} ---")
+
+        fix_random_seed(s)
+        torch.backends.cudnn.deterministic = True
+
+        tta_acc, pre_acc_val = train_target(args)
+        total_tta[si] = tta_acc
+        total_pre[si] = pre_acc_val
+
+        logger.info(f"TTA {tta_acc:.3f}, Pre {pre_acc_val:.3f}")
+        args.log.record(f"TTA {tta_acc:.3f}, Pre {pre_acc_val:.3f}")
+
+        # save per-seed accuracy
+        np.savetxt(
+            os.path.join(
+                args.result_dir,
+                f"{args.data}_T-TIME_seed_{s}_subject_{idt}_acc.csv"
+            ),
+            np.array([tta_acc, pre_acc_val]),
+            delimiter=","
         )
-        logger.info(summary)
-        args.log.record(summary)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-        # ─── Grand ensemble means across subjects ─────────────────────────
-        mt = np.array(ensemble_tta_all)
-        mp = np.array(ensemble_pre_all)
-        gm = (
-            f"Grand Ensemble Means:\n"
-            f"  TTA    : MeanProb={mt[:,0].mean():.2f}%, MedianProb={mt[:,1].mean():.2f}%, SML={mt[:,2].mean():.2f}%\n"
-            f"  Pre-TTA: MeanProb={mp[:,0].mean():.2f}%, MedianProb={mp[:,1].mean():.2f}%, SML={mp[:,2].mean():.2f}%"
+    # subject‐level summary
+    n = len(seeds)
+    t_val = stats.t.ppf(0.975, n-1)
+    mu_tta, sd_tta = total_tta.mean(), total_tta.std()
+    ci_tta = t_val * sd_tta / np.sqrt(n)
+    mu_pre, sd_pre = total_pre.mean(), total_pre.std()
+    ci_pre = t_val * sd_pre / np.sqrt(n)
+
+    summary = (
+        f"{target}: TTA {mu_tta:.3f}±{sd_tta:.3f} (95% CI [{mu_tta-ci_tta:.3f}, {mu_tta+ci_tta:.3f}]); "
+        f"Pre {mu_pre:.3f}±{sd_pre:.3f} (95% CI [{mu_pre-ci_pre:.3f}, {mu_pre+ci_pre:.3f}])"
+    )
+    logger.info(summary); args.log.record(summary)
+
+    # --- load all TTA probs and ensemble ---
+    _, _, X_tar, y_tar = args.mi_data_loaded
+
+    # load Pre-TTA probs (each file is shape (n_samples,))
+    preds_pre = np.vstack([
+        np.loadtxt(
+            os.path.join(
+                args.result_dir,
+                f"{args.data_name}_T-TIME_seed_{s}_pre_probs.csv"
+            ),
+            delimiter=","
         )
-        logger.info(gm)
-        args.log.record(gm)
-    # end of for data_name
+        for s in seeds
+    ])  # shape: (n_seeds, n_samples)
+
+    # load T-TTA probs (each file is shape (n_samples,))
+    preds_tta = [
+        np.loadtxt(
+            os.path.join(args.result_dir,
+                         f"{args.data_name}_T-TIME_seed_{s}_tta_probs.csv"),
+            delimiter=","
+        )
+        for s in seeds
+    ]
+    preds_tta = np.vstack(preds_tta)    # now (n_seeds, n_samples)
+
+    labels_tta = (preds_tta > 0.5).astype(int)
+    mean_vote_tta   = (preds_tta.mean(0) > 0.5).astype(int)
+    med_vote_tta    = (np.median(preds_tta, 0) > 0.5).astype(int)
+    sml_vote_tta    = SML(preds_tta)
+
+    acc_tta = [
+        accuracy_score(y_tar, mean_vote_tta) * 100,
+        accuracy_score(y_tar, med_vote_tta) * 100,
+        accuracy_score(y_tar, sml_vote_tta) * 100
+    ]
+    logger.info(
+        f"Ensemble TTA: MeanProb={acc_tta[0]:.2f}%, "
+        f"MedianProb={acc_tta[1]:.2f}%, SML={acc_tta[2]:.2f}%"
+    )
+    args.log.record(
+        f"Ensemble TTA: MeanProb={acc_tta[0]:.2f}%, "
+        f"MedianProb={acc_tta[1]:.2f}%, SML={acc_tta[2]:.2f}%"
+    )
+
+    # ← replace with single‐column load via numpy:
+    preds_pre = np.vstack([
+        np.loadtxt(
+            os.path.join(
+                args.result_dir,
+                f"{args.data_name}_T-TIME_seed_{s}_pre_probs.csv"
+            ),
+            delimiter=","
+        )
+        for s in seeds
+    ])  # shape: (n_seeds, n_samples)
+
+    # now compute votes exactly as for TTA:
+    mean_vote_pre = (preds_pre.mean(0) > 0.5).astype(int)
+    med_vote_pre  = (np.median(preds_pre, 0) > 0.5).astype(int)
+    sml_vote_pre  = SML(preds_pre)
+
+    acc_pre_ens = [
+        accuracy_score(y_tar, mean_vote_pre) * 100,
+        accuracy_score(y_tar, med_vote_pre) * 100,
+        accuracy_score(y_tar, sml_vote_pre) * 100
+    ]
+    logger.info(
+        f"Ensemble Pre-TTA: MeanProb={acc_pre_ens[0]:.2f}%, "
+        f"MedianProb={acc_pre_ens[1]:.2f}%, SML={acc_pre_ens[2]:.2f}%"
+    )
+    args.log.record(
+        f"Ensemble Pre-TTA: MeanProb={acc_pre_ens[0]:.2f}%, "
+        f"MedianProb={acc_pre_ens[1]:.2f}%, SML={acc_pre_ens[2]:.2f}%"
+    )
+
+    # per‐session breakdown (TTA only, can mirror for Pre if desired)
+    sess_tta_break = []
+    for idx, (s_idx, e_idx) in enumerate(getattr(args, 'tar_bounds', [])):
+        sess_name = args.session_names[idx]
+        subp = preds_tta[:, s_idx:e_idx]
+        suby = y_tar[s_idx:e_idx]
+        votes = [
+            accuracy_score(suby, (subp.mean(0)>0.5).astype(int)) * 100,
+            accuracy_score(suby, (np.median(subp,0)>0.5).astype(int)) * 100,
+            accuracy_score(suby, SML(subp)) * 100
+        ]
+        logger.info(f"  TTA {sess_name}: Mean={votes[0]:.2f}%, Median={votes[1]:.2f}%, SML={votes[2]:.2f}%")
+        args.log.record(f"  TTA {sess_name}: Mean={votes[0]:.2f}%, Median={votes[1]:.2f}%, SML={votes[2]:.2f}%")
+        sess_tta_break.append([sess_name] + votes)
+
+    # ←── new: pre-TTA session breakdown ──→
+    sess_pre_break = []
+    
+    for idx, (s_idx, e_idx) in enumerate(getattr(args, 'tar_bounds', [])):
+        sess_name = args.session_names[idx]
+        subp_pre = preds_pre[:, s_idx:e_idx]
+        suby     = y_tar[s_idx:e_idx]
+        votes_pre = [
+            accuracy_score(suby, (subp_pre.mean(0)>0.5).astype(int)) * 100,
+            accuracy_score(suby, (np.median(subp_pre,0)>0.5).astype(int)) * 100,
+            # use untransposed subp_pre as SML expects (members × samples)
+            accuracy_score(suby, SML(subp_pre)) * 100
+        ]
+        logger.info(f"  Pre-TTA {sess_name}: Mean={votes_pre[0]:.2f}%, Median={votes_pre[1]:.2f}%, SML={votes_pre[2]:.2f}%")
+        args.log.record(f"  Pre-TTA {sess_name}: Mean={votes_pre[0]:.2f}%, Median={votes_pre[1]:.2f}%, SML={votes_pre[2]:.2f}%")
+        sess_pre_break.append([sess_name] + votes_pre)
+
+    # ←── updated return signature ──→
+    return total_tta, total_pre, acc_tta, acc_pre_ens, sess_tta_break, sess_pre_break
+
+
+def build_and_save_results(args, total_tta, total_pre,
+                           ens_tta_list, ens_pre_list,
+                           session_tta_breaks, session_pre_breaks):
+    overall = {
+        'tta': {
+            'mean':   float(total_tta.mean()),
+            'median': float(np.median(total_tta)),
+            'std':    float(total_tta.std())
+        },
+        'pre_tta': {
+            'mean':   float(total_pre.mean()),
+            'median': float(np.median(total_pre)),
+            'std':    float(total_pre.std())
+        }
+    }
+    ens_tta_arr = np.array(ens_tta_list)
+    ens_pre_arr = np.array(ens_pre_list)
+    ensemble = {
+        'tta': {
+            'mean_prob':   float(ens_tta_arr[:, 0].mean()),
+            'median_prob': float(ens_tta_arr[:, 1].mean()),
+            'sml':         float(ens_tta_arr[:, 2].mean())
+        },
+        'pre_tta': {                          # ← added pre‐TTA summary
+            'mean_prob':   float(ens_pre_arr[:, 0].mean()),
+            'median_prob': float(ens_pre_arr[:, 1].mean()),
+            'sml':         float(ens_pre_arr[:, 2].mean())
+        }
+    }
+
+    result = {
+        'hyperparams': vars(args).copy(),
+        'per_seed_per_subject': {
+            'tta':     total_tta.tolist(),
+            'pre_tta': total_pre.tolist()
+        },
+        'overall': overall,
+        'ensemble': ensemble,
+        'session_tta_breakdowns':     session_tta_breaks,
+        'session_pre_tta_breakdowns': session_pre_breaks  # ← new
+    }
+
+    for k in ['mi_data_loaded', 'log', 'out_file']:
+        result['hyperparams'].pop(k, None)
+
+    path = os.path.join(
+        args.result_dir,
+        f"results_mtta{args.max_tta}_str{args.stride}_t{args.t}"
+        f"_lr{args.lr}_st{args.steps}.json"
+    )
+    with open(path, 'w') as jf:
+        json.dump(result, jf, indent=2)
+        jf.flush(); os.fsync(jf.fileno())
+    logger.info(f"Saved structured results to {path}")
+
+
+def main():
+    data_names = ['CustomEpoch']
+    for data_name in data_names:
+        df_meta, files, subject_names = load_metadata(data_name)
+        paradigm, N, chn, class_num, tsn, sr, tn, fdd = get_dataset_params(
+            data_name, subject_names, df_meta
+        )
+        grid = build_hyperparam_grid()
+        base_args = build_base_args(
+            data_name, paradigm, N, chn, class_num, tsn, sr, tn, fdd
+        )
+        seeds = [2,3,5,6,7,8,9,11,12]
+
+        for hp_values in product(*grid.values()):
+            hp = dict(zip(grid.keys(), hp_values))
+            args = argparse.Namespace(**vars(base_args))
+            setup_run(args, data_name, hp)
+
+            all_tta_acc    = []
+            all_pre_acc    = []
+            all_ens_tta    = []
+            all_ens_pre    = []
+            all_sess_tta   = []
+            all_sess_pre   = []
+
+            for idt in range(N):
+                tta, pre, etta, epre, sb_tta, sb_pre = run_subject(
+                    args, idt, files, subject_names, seeds
+                )
+                all_tta_acc.append(tta)
+                all_pre_acc.append(pre)
+                all_ens_tta.append(etta)
+                all_ens_pre.append(epre)
+
+                # prepend subject name to each session row
+                all_sess_tta += [[subject_names[idt]] + row for row in sb_tta]
+                all_sess_pre += [[subject_names[idt]] + row for row in sb_pre]
+
+            # flatten arrays as before …
+            tta_arr      = np.hstack(all_tta_acc)
+            pre_arr      = np.hstack(all_pre_acc)
+            ens_tta_flat = [x for trio in all_ens_tta for x in [trio]]
+            ens_pre_flat = [x for trio in all_ens_pre for x in [trio]]
+
+            build_and_save_results(
+                args,
+                tta_arr,
+                pre_arr,
+                ens_tta_flat,
+                ens_pre_flat,
+                all_sess_tta,
+                all_sess_pre    # ← pass new
+            )
+
+
+if __name__ == '__main__':
+    main()

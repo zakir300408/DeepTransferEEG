@@ -402,48 +402,45 @@ def data_alignment(X, num_subjects, args):
     if args.data == 'CustomEpoch':
         print(f"=== CustomEpoch EA start (idt={args.idt}, num_subjects={num_subjects}) input shape: {X.shape}")
         meta   = pd.read_csv('./data/CustomEpoch/meta.csv')
-        counts = meta['n_trials'].values               # trials per session
-        # compute cumulative boundaries
+        counts = meta['n_trials'].values
         starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
         ends   = np.cumsum(counts)
-        # list of target sessions
-        idts = args.idt if isinstance(args.idt, (list, tuple)) else [args.idt]
-        # decide which sessions to align
+        idts   = args.idt if isinstance(args.idt, (list, tuple)) else [args.idt]
+
         if num_subjects == args.N - len(idts):
             # source: drop target sessions
-            counts_src = np.delete(counts, idts)
-            starts_src = np.concatenate(([0], np.cumsum(counts_src)[:-1]))
-            ends_src   = np.cumsum(counts_src)
-            out = []
+            counts_src  = np.delete(counts, idts)
+            starts_src  = np.concatenate(([0], np.cumsum(counts_src)[:-1]))
+            ends_src    = np.cumsum(counts_src)
+            out, shapes = [], []
             for k in range(len(counts_src)):
                 seg = X[starts_src[k]:ends_src[k]]
-                print(f"  EA on source segment {k}: shape {seg.shape}")
+                shapes.append(seg.shape)
                 out.append(EA(seg))
+            print(f"  EA on source segments shapes: {shapes}")
             aligned = np.concatenate(out, axis=0)
             print(f"=== CustomEpoch EA source done, concatenated shape: {aligned.shape}")
             return aligned
+
         elif num_subjects == len(idts):
-            # target: align each selected session separately
-            # target: split X (which is already only the target sessions in args.idt order)
-            out = []
-            meta = pd.read_csv('./data/CustomEpoch/meta.csv')
-            counts = meta['n_trials'].values
-            # pick only this subject’s sessions
-            sel_counts = counts[idts]
-            # build local starts/ends
-            local_starts = np.concatenate(([0], np.cumsum(sel_counts)[:-1]))
-            local_ends   = np.cumsum(sel_counts)
-            for k, (s_loc, e_loc) in enumerate(zip(local_starts, local_ends)):
+            # target: align each selected session
+            counts_sel   = counts[idts]
+            starts_loc   = np.concatenate(([0], np.cumsum(counts_sel)[:-1]))
+            ends_loc     = np.cumsum(counts_sel)
+            out, shapes  = [], []
+            for k, (s_loc, e_loc) in enumerate(zip(starts_loc, ends_loc)):
                 seg = X[s_loc:e_loc]
-                print(f"  EA on target segment local #{k}: shape {seg.shape}")
+                shapes.append(seg.shape)
                 if seg.shape[0] > 0:
                     out.append(EA(seg))
+            print(f"  EA on target segments shapes: {shapes}")
             if not out:
                 print("  No non-empty target segments; skipping EA for target")
                 return X
             aligned = np.concatenate(out, axis=0)
             print(f"=== CustomEpoch EA target done, concatenated shape: {aligned.shape}")
             return aligned
+
         else:
             raise ValueError("Invalid num_subjects for CustomEpoch EA")
 
