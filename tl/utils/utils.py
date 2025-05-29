@@ -486,13 +486,17 @@ def data_loader(Xs=None, Ys=None, Xt=None, Yt=None, args=None):
     train_bs = args.batch_size
 
     Xt_copy = Xt
-    if args.align:
-        # offline EA per session
+
+    # only apply offline EA per session when training (max_epoch>0)
+    if args.align and getattr(args, 'max_epoch', 0) > 0:
         idt_list = args.idt if isinstance(args.idt, (list, tuple)) else [args.idt]
         # source has total sessions minus len(idt_list)
         Xs = data_alignment(Xs, args.N - len(idt_list), args)
         # target has len(idt_list) sessions
         Xt = data_alignment(Xt, len(idt_list), args)
+    else:
+        # skipping offline EA (e.g. pre-TTA / max_epoch==0)
+        pass
 
     Xs, Ys = tr.from_numpy(Xs).to(
         tr.float32), tr.from_numpy(Ys.reshape(-1, )).to(tr.long)

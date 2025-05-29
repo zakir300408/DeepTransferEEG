@@ -13,7 +13,7 @@ from utils.network import backbone_net
 from utils.LogRecord import LogRecord
 from utils.dataloader import read_mi_combine_tar
 from utils.utils import fix_random_seed, cal_acc_comb, data_loader, cal_auc_comb, cal_score_online
-from utils.alg_utils import EA_online
+from utils.alg_utils import EA_online, EA
 from utils.loss import Entropy
 from sklearn.metrics import roc_auc_score, accuracy_score
 from ttime_ensemble import SML                # << add this import
@@ -125,6 +125,7 @@ def TTIME(loader, model, args, balanced=True):
 
     y_true = []
     y_pred = []
+    # Remove y_pred_post - no longer needed
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     
@@ -200,10 +201,7 @@ def TTIME(loader, model, args, balanced=True):
         labels = labels.float().cpu()
         _, predict = torch.max(outputs, 1)
 
-        # logger.info(f"Trial {i}: pred={predict.item()}, gt={labels.item()}")
-        # if hasattr(args, 'log'):
-        #     args.log.record(f"Trial {i}: pred={predict.item()}, gt={labels.item()}")
-
+        # Record Phase 1 predictions only
         y_pred.append(softmax_out.detach().cpu().numpy())
         y_true.append(labels.item())
 
@@ -297,9 +295,9 @@ def TTIME(loader, model, args, balanced=True):
                     opt_ms = (time.time() - opt_start) * 1000
                     logger.debug(f"[T-TIME] iter {i}, step {step}: backward+opt {opt_ms:.1f} ms")
 
-            TTA_time = time.time()
             if args.calc_time:
-                logger.info(f"sample {i}, post-inference model update finished in ms: {np.round((TTA_time - start_time)*1000,3)}")
+                tta_time = time.time()
+                logger.info(f"sample {i}, post-inference model update finished in ms: {np.round((tta_time - dl_start)*1000,3)}")
 
             if not balanced:
                 # initialize threshold once
@@ -313,36 +311,33 @@ def TTIME(loader, model, args, balanced=True):
                     elif pl[l] == 1 and softmax_out[l][1] > args.pred_thresh:
                         zk_arrs[1] += 1
 
-        model.eval()
+        model.eval()  # restore eval mode for next iteration
+        # Remove Phase 3 - no post-adaptation inference needed
 
+    # --- after loop: compute metrics on Phase 1 preds ---
     if balanced:
-        # binary case: use fixed threshold (args.pre_thresh or default 0.5)
         if args.class_num == 2:
             y_scores = np.array(y_pred).reshape(-1, args.class_num)[:, 1]
             thresh = getattr(args, 'pre_thresh', 0.5)
             preds = (y_scores > thresh).astype(int)
             score = accuracy_score(y_true, preds)
+            y_pred_final = y_scores
         else:
-            # multiclass: default argmax
-            _, predict = torch.max(torch.from_numpy(np.array(y_pred))
-                               .to(torch.float32).reshape(-1, args.class_num), 1)
-            preds = torch.squeeze(predict).float().numpy().astype(int)
+            arr = torch.from_numpy(np.array(y_pred)).to(torch.float32)
+            _, predict = torch.max(arr.reshape(-1, args.class_num), 1)
+            preds = predict.cpu().numpy().astype(int)
             score = accuracy_score(y_true, preds)
-        # retain y_pred formatting
-        if args.data_name == 'BNCI2014001-4':
-            y_pred = np.array(y_pred).reshape(-1,)  # multiclass
-        else:
-            y_pred = y_scores
+            y_pred_final = preds
     else:
-        predict = torch.from_numpy(np.array(y_pred)).to(torch.float32).reshape(-1, args.class_num)
-        y_pred = np.array(predict).reshape(-1, args.class_num)[:, 1]  # binary
-        score = roc_auc_score(y_true, y_pred)
+        arr = torch.from_numpy(np.array(y_pred)).to(torch.float32)
+        y_scores = arr.reshape(-1, args.class_num)[:, 1].cpu().numpy()
+        score = roc_auc_score(y_true, y_scores)
+        y_pred_final = y_scores
 
-    # after loop ends, ensure sqrtRefEA exists when align=True
     if args.align:
-        return score * 100, y_pred, sqrtRefEA
+        return score * 100, y_pred_final, sqrtRefEA
     else:
-        return score * 100, y_pred, None
+        return score * 100, y_pred_final, None
 
 
 def train_target(args):
@@ -350,6 +345,7 @@ def train_target(args):
         extra_string = '_noEA'
     else:
         extra_string = ''
+    # at top of function they already compute idt_str for ckpt names
     if isinstance(args.idt, (list, tuple)):
         idt_str = '_'.join(map(str, args.idt))
     else:
@@ -405,7 +401,7 @@ def train_target(args):
         logger.info(f"Task: {args.task_str}, Pre-TTA IEA {metric} = {pre_acc:.2f}%")
         args.log.record(f"Task: {args.task_str}, Pre-TTA IEA {metric} = {pre_acc:.2f}%")
 
-        # after loading best model, save Pre‐TTA probabilities
+        # after loading best model, save Pre-TTA probabilities
         # Route Pre-TTA through TTIME (align=True, no adaptation)
         base_network.eval()
         loader_pre = DataLoader(
@@ -416,7 +412,13 @@ def train_target(args):
         # PRE‐TTA inference (no adaptation)
         src_model = copy.deepcopy(base_network).to(args.device).eval()
         # initialize EA reference for pre-TTA
-        R = 0 if args.align else None
+        if args.align:
+            # init R to mean source-domain covariance (with small ridge)
+            covs = np.array([np.cov(x) for x in X_src])
+            R = covs.mean(axis=0) + np.eye(covs.shape[1]) * 1e-6
+        else:
+            R = None
+
         pre_y_pred = []
         with torch.no_grad():
             for i, (x, _) in enumerate(loader_pre):
@@ -427,38 +429,39 @@ def train_target(args):
                     # update & apply EA whitening per sample
                     sample = x.squeeze(0).squeeze(0)               # (chn, time)
                     sample_np = sample.cpu().numpy()
+                    # -- whiten with old R first (no snooping) --
+                    R_reg = R + np.eye(R.shape[0]) * 1e-6
+                    R_t   = torch.from_numpy(R_reg).to(device=args.device, dtype=sample.dtype)
+                    ev, evec     = LA.eigh(R_t)
+                    sqrtRefEA    = evec @ torch.diag(ev.pow(-0.5)) @ evec.T
+                    sample       = sqrtRefEA @ sample
+                    # -- now update R to include this new sample --
                     R = EA_online(sample_np, R, i)
                     R += np.eye(R.shape[0]) * 1e-6
-                    R_t = torch.from_numpy(R).to(device=args.device, dtype=sample.dtype)
-                    ev, evec = LA.eigh(R_t)
-                    sqrtRefEA = evec @ torch.diag(ev.pow(-0.5)) @ evec.T
-                    sample = sqrtRefEA @ sample
                     x = sample.reshape(1,1,args.chn,args.time_sample_num)
                 _, logits = src_model(x)
                 soft = nn.Softmax(dim=1)(logits)
                 pre_y_pred.append(soft.cpu().numpy())
         pre_y_pred = np.concatenate(pre_y_pred, axis=0)
-        # current: saves both class‐0 and class‐1 probs shape (n_samples,2)
-        # np.savetxt(os.path.join(args.result_dir,
-        #            f"{args.data_name}_T-TIME_seed_{args.SEED}_pre_probs.csv"),
-        #           pre_y_pred, delimiter=",")
-        # replace with only the positive‐class probs:
         pos_probs = pre_y_pred[:, 1]
-        np.savetxt(os.path.join(args.result_dir,
-                   f"{args.data_name}_T-TIME_seed_{args.SEED}_pre_probs.csv"),
-                   pos_probs, delimiter=",")
+        np.savetxt(
+            os.path.join(args.result_dir,
+                         f"{args.data_name}_T-TIME_seed_{args.SEED}_subj{idt_str}_pre_probs.csv"),
+            pos_probs, delimiter=",")
         # use fixed threshold for Pre-TTA
         args.pre_thresh = 0.5
         # POST-TTA streaming adaptation
         adapted_model = copy.deepcopy(base_network).to(args.device)
         adapted_model.apply(_reset_batchnorm)           # <<< reset BN stats
         tta_score, tta_y_pred, _ = TTIME(loader_pre, adapted_model, args=args, balanced=args.balanced)
-        np.savetxt(os.path.join(args.result_dir,
-                    f"{args.data_name}_T-TIME_seed_{args.SEED}_tta_probs.csv"),
-                   tta_y_pred, delimiter=",")
+        np.savetxt(
+            os.path.join(args.result_dir,
+                         f"{args.data_name}_T-TIME_seed_{args.SEED}_subj{idt_str}_tta_probs.csv"),
+            tta_y_pred, delimiter=",")
         best_ckpt_adapted = f'./runs/{args.data_name}/{args.backbone}_S{idt_str}_seed{args.SEED}{extra_string}_adapted.ckpt'
         torch.save(adapted_model.state_dict(), best_ckpt_adapted)
         return tta_score, pre_acc
+
     else:
         criterion = nn.CrossEntropyLoss()
         optimizer_f = optim.Adam(netF.parameters(), lr=args.lr)
@@ -547,7 +550,12 @@ def train_target(args):
         # PRE‐TTA inference (no adaptation)
         src_model = copy.deepcopy(base_network).to(args.device).eval()
         # initialize EA reference for pre-TTA
-        R = 0 if args.align else None
+        if args.align:
+            covs = np.array([np.cov(x) for x in X_src])
+            R = covs.mean(axis=0) + np.eye(covs.shape[1]) * 1e-6
+        else:
+            R = None
+
         pre_y_pred = []
         with torch.no_grad():
             for i, (x, _) in enumerate(loader_pre):
@@ -558,12 +566,15 @@ def train_target(args):
                     # update & apply EA whitening per sample
                     sample = x.squeeze(0).squeeze(0)               # (chn, time)
                     sample_np = sample.cpu().numpy()
+                    # -- whiten with old R first (no snooping) --
+                    R_reg = R + np.eye(R.shape[0]) * 1e-6
+                    R_t   = torch.from_numpy(R_reg).to(device=args.device, dtype=sample.dtype)
+                    ev, evec     = LA.eigh(R_t)
+                    sqrtRefEA    = evec @ torch.diag(ev.pow(-0.5)) @ evec.T
+                    sample       = sqrtRefEA @ sample
+                    # -- now update R to include this new sample --
                     R = EA_online(sample_np, R, i)
                     R += np.eye(R.shape[0]) * 1e-6
-                    R_t = torch.from_numpy(R).to(device=args.device, dtype=sample.dtype)
-                    ev, evec = LA.eigh(R_t)
-                    sqrtRefEA = evec @ torch.diag(ev.pow(-0.5)) @ evec.T
-                    sample = sqrtRefEA @ sample
                     x = sample.reshape(1,1,args.chn,args.time_sample_num)
                 _, logits = src_model(x)
                 soft = nn.Softmax(dim=1)(logits)
@@ -575,18 +586,20 @@ def train_target(args):
         #           pre_y_pred, delimiter=",")
         # replace with only the positive‐class probs:
         pos_probs = pre_y_pred[:, 1]
-        np.savetxt(os.path.join(args.result_dir,
-                   f"{args.data_name}_T-TIME_seed_{args.SEED}_pre_probs.csv"),
-                   pos_probs, delimiter=",")
+        np.savetxt(
+            os.path.join(args.result_dir,
+                         f"{args.data_name}_T-TIME_seed_{args.SEED}_subj{idt_str}_pre_probs.csv"),
+            pos_probs, delimiter=",")
         # use fixed threshold for Pre-TTA
         args.pre_thresh = 0.5
         # POST-TTA streaming adaptation
         adapted_model = copy.deepcopy(base_network).to(args.device)
         adapted_model.apply(_reset_batchnorm)           # <<< reset BN stats
         tta_score, tta_y_pred, _ = TTIME(loader_pre, adapted_model, args=args, balanced=args.balanced)
-        np.savetxt(os.path.join(args.result_dir,
-                    f"{args.data_name}_T-TIME_seed_{args.SEED}_tta_probs.csv"),
-                   tta_y_pred, delimiter=",")
+        np.savetxt(
+            os.path.join(args.result_dir,
+                         f"{args.data_name}_T-TIME_seed_{args.SEED}_subj{idt_str}_tta_probs.csv"),
+            tta_y_pred, delimiter=",")
         best_ckpt_adapted = f'./runs/{args.data_name}/{args.backbone}_S{idt_str}_seed{args.SEED}{extra_string}_adapted.ckpt'
         torch.save(adapted_model.state_dict(), best_ckpt_adapted)
         return tta_score, pre_acc
@@ -621,11 +634,9 @@ def get_dataset_params(data_name, subject_names, df_meta):
 
 def build_hyperparam_grid():
     return {
-        'max_tta': [8, 10],
-        'stride':  [1, 2, 3],
-        't':       [1.5, 1.7, 1.8, 1.9, 2.0, 2.2],
+        't':       [1.5, 1.7, 1.9, 2.0],
         'lr':      [0.0001, 0.0005],
-        'steps':   [1, 3, 5],
+        'steps':   [1, 3],
     }
 
 
@@ -649,7 +660,10 @@ def build_base_args(data_name, paradigm, N, chn, class_num,
     args.use_pretrained_model = True
     args.balanced         = True
     args.calc_time        = False
-    args.max_parallel_seeds = 4  # default parallel seeds
+    args.max_parallel_seeds = 4
+    # Fixed hyperparameters
+    args.max_tta          = 8
+    args.stride           = 1
     args.device           = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     args.data_env         = 'gpu' if torch.cuda.is_available() else 'local'
     return args
@@ -657,9 +671,7 @@ def build_base_args(data_name, paradigm, N, chn, class_num,
 
 
 def setup_run(args, data_name, hp):
-    # hyperparams
-    args.max_tta = hp['max_tta']
-    args.stride  = hp['stride']
+    # hyperparams from grid
     args.t       = hp['t']
     args.lr      = hp['lr']
     args.steps   = hp['steps']
@@ -729,6 +741,9 @@ def run_subject(args, idt, files, subject_names, seeds):
     args.tar_bounds    = [(s,e) for s,e in zip(starts, ends)]
     args.session_names = [df_meta['file'].iloc[i] for i in args.idt]
     
+    # derive the same subject‐ID string
+    idt_str = '_'.join(map(str, args.idt))
+    
     # — header —
     logger.info(f"\n=== Transfer to {target} ===")
     args.log.record(f"Transfer to {target}")
@@ -741,15 +756,26 @@ def run_subject(args, idt, files, subject_names, seeds):
     # — dispatch in batches of K seeds —
     K = getattr(args, 'max_parallel_seeds', 4)
     results = []
-    for i in range(0, len(params), K):
-        batch = params[i:i+K]
-        batch_seeds = [p[4] for p in batch]
-        logger.info(f"Processing seeds batch: {batch_seeds}")
-        with Pool(processes=len(batch)) as pool:
-            results.extend(pool.map(_run_one_seed_global, batch))
+    
+    # Process all batches sequentially
+    for i in range(0, len(seeds), K):
+        batch_seeds = seeds[i:i+K]
+        batch_params = [(sanitized, idt, files, subject_names, s) for s in batch_seeds]
+        
+        logger.info(f"Processing seeds batch {i//K + 1}/{(len(seeds)-1)//K + 1}: {batch_seeds}")
+        
+        with Pool(processes=len(batch_params)) as pool:
+            batch_results = pool.map(_run_one_seed_global, batch_params)
+            results.extend(batch_results)
+        
+        # Force cleanup between batches
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        
+        logger.info(f"Completed batch {i//K + 1}, processed {len(results)}/{len(seeds)} seeds so far")
 
+    logger.info(f"Finished processing all {len(results)} seeds for subject {target}")
+    
     # — per-seed summary —
     total_tta = np.array([r[0] for r in results])
     total_pre = np.array([r[1] for r in results])
@@ -778,14 +804,14 @@ def run_subject(args, idt, files, subject_names, seeds):
     preds_pre = np.vstack([
         np.loadtxt(os.path.join(
             args.result_dir,
-            f"{args.data_name}_T-TIME_seed_{s}_pre_probs.csv"
+            f"{args.data_name}_T-TIME_seed_{s}_subj{idt_str}_pre_probs.csv"
         ), delimiter=",")
         for s in seeds
     ])
     preds_tta = np.vstack([
         np.loadtxt(os.path.join(
             args.result_dir,
-            f"{args.data_name}_T-TIME_seed_{s}_tta_probs.csv"
+            f"{args.data_name}_T-TIME_seed_{s}_subj{idt_str}_tta_probs.csv"
         ), delimiter=",")
         for s in seeds
     ])
