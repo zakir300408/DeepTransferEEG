@@ -539,10 +539,10 @@ if __name__ == '__main__':
         lr = 0.0005
 
         # max_tta: maximum sliding‐window size for TTA
-        max_tta = 20
+        max_tta = 8
 
         # update step
-        steps = 5
+        steps = 1
 
         # update stride
         stride = 1
@@ -552,7 +552,7 @@ if __name__ == '__main__':
         align = True
 
         # temperature rescaling, for test entropy calculation
-        t = 1.7
+        t = 1.5
 
         # whether to test balanced or imbalanced (2:1) target subject
         balanced = True
