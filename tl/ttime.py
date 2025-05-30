@@ -591,10 +591,10 @@ def build_base_args(data_name, paradigm, N, chn, class_num,
     args.backbone         = 'EEGNet'
     args.batch_size       = 128
     args.align            = True
-    args.use_pretrained_model = False
+    args.use_pretrained_model = True
     args.balanced         = True
     args.calc_time        = False
-    args.max_parallel_seeds = 1
+    args.max_parallel_seeds = 4
     # Fixed hyperparameters
     args.max_tta          = 8
     args.stride           = 1
