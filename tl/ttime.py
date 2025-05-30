@@ -512,11 +512,15 @@ def train_and_evaluate_flow(args, base_net, X_src, y_src, X_tar, y_tar, dset_loa
                 torch.save(base_net.state_dict(), ckpt_best)
             base_net.train()
 
-    # load best, then reuse zero-epoch helpers for Pre-TTA & TTA
+    # load best, then create fresh copy with BN reset like zero_epoch_flow does
     base_net.load_state_dict(torch.load(ckpt_best, map_location=args.device))
     logger.info(f"[CONFIRM] Loaded best model excludes targets {args.idt}")
-
-    return zero_epoch_flow(args, base_net, X_src, y_src, X_tar, y_tar, idt_str, extra)
+    
+    # Create fresh copy and reset BN stats (same as zero_epoch_flow)
+    fresh_net = copy.deepcopy(base_net).to(args.device)
+    fresh_net.apply(_reset_batchnorm)
+    
+    return zero_epoch_flow(args, fresh_net, X_src, y_src, X_tar, y_tar, idt_str, extra)
 
 def train_target(args):
     """Top‐level entry for each seed: either zero-epoch or full train then zero_epoch_flow."""
@@ -587,10 +591,10 @@ def build_base_args(data_name, paradigm, N, chn, class_num,
     args.backbone         = 'EEGNet'
     args.batch_size       = 128
     args.align            = True
-    args.use_pretrained_model = True
+    args.use_pretrained_model = False
     args.balanced         = True
     args.calc_time        = False
-    args.max_parallel_seeds = 4
+    args.max_parallel_seeds = 1
     # Fixed hyperparameters
     args.max_tta          = 8
     args.stride           = 1
