@@ -1,12 +1,7 @@
 import sys
 import os
 
-# Add the directory containing step_1_load_data to Python's search path
-# This is useful if main.py is in a different directory or for cleaner imports.
-# Assuming step_1_load_data.py is in the same directory as main.py
-# If step_1_load_data.py is in a subdirectory, adjust path accordingly.
-# current_dir = os.path.dirname(os.path.abspath(__file__))
-# sys.path.append(current_dir) # Not strictly needed if in same dir
+# (Removed redundant commented-out path manipulation code)
 
 from step_1_load_data import load_custom_epoch_data # Updated import
 
