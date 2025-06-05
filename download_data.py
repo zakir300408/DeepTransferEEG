@@ -20,6 +20,14 @@ IGNORE_START_SECONDS_CUSTOM = 2
 IGNORE_END_SECONDS_CUSTOM   = 2
 SAMPLE_RATE_CUSTOM = 200
 
+CH_NAMES = [
+    'FP1','FZ','F3','F7','FT7','FC5','FC1','C3','T7','TP7','CP5','CP1','PZ',
+    'P3','P7','O1','O2','P4','P8','TP8','CP6','CP2','CZ','C4','T8','FT8',
+    'FC6','FC2','F4','F8','FP2'
+]
+DROP_CHANNELS = ['FT7','TP7','TP8','FT8']
+_DROP_IDX = [CH_NAMES.index(ch) for ch in DROP_CHANNELS]
+_KEEP_IDX = [i for i in range(len(CH_NAMES)) if i not in _DROP_IDX]
 
 # new helper: use SciPy decimate for anti-alias filtering + downsampling
 def downsample_epochs(X, decimation_factor=2):
@@ -66,6 +74,10 @@ def dataset_to_file(dataset_name, data_save):
             X = downsample_epochs(X, decimation_factor=2)
             after  = X.shape[2]
             print(f"Downsampled: samples per trial {before} → {after}")
+
+            # NEW: drop unwanted channels
+            X = X[:, _KEEP_IDX, :]
+            print(f"Dropped channels {DROP_CHANNELS}, new shape {X.shape}")
 
             y = mat['MyLabel'].flatten()
             all_X.append(X)
