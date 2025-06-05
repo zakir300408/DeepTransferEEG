@@ -39,7 +39,7 @@ def data_process(dataset):
         meta = pd.read_csv('./data/CustomEpoch/meta.csv')
         num_subjects = len(meta)
         paradigm     = 'MI'
-        sample_rate  = 200
+        sample_rate  = 100
         ch_num       = X.shape[1]
 
         # apply 50 Hz notch and 8–32 Hz bandpass in one go:

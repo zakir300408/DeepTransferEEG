@@ -240,22 +240,19 @@ def TTIME(loader, model, args, balanced=True):
         model.eval()
 
     if balanced:
-        # binary case: calibrate threshold via Youden’s J
         if args.class_num == 2:
-            # extract positive-class scores
+            # binary case: use fixed 0.5 threshold (no Youden's J)
             y_scores = np.array(y_pred).reshape(-1, args.class_num)[:, 1]
-            # compute ROC curve
-            fpr, tpr, thresholds = roc_curve(y_true, y_scores)
-            # Youden’s J statistic
-            optimal_idx = np.argmax(tpr - fpr)
-            best_thresh = thresholds[optimal_idx]
-            # apply best threshold
-            preds = (y_scores > best_thresh).astype(int)
-            score = accuracy_score(y_true, preds)
+            preds    = (y_scores > 0.5).astype(int)
+            score    = accuracy_score(y_true, preds)
         else:
             # multiclass: default argmax
-            _, predict = torch.max(torch.from_numpy(np.array(y_pred))
-                               .to(torch.float32).reshape(-1, args.class_num), 1)
+            _, predict = torch.max(
+                torch.from_numpy(np.array(y_pred))
+                     .to(torch.float32)
+                     .reshape(-1, args.class_num),
+                1
+            )
             preds = torch.squeeze(predict).float().numpy().astype(int)
             score = accuracy_score(y_true, preds)
         # retain y_pred formatting
@@ -353,15 +350,12 @@ def train_target(args):
         np.savetxt(os.path.join(args.result_dir,
                     f"{args.data_name}_T-TIME_seed_{args.SEED}_pre_probs.csv"),
                    pre_y_pred, delimiter=",")
-        # --- calibrate Pre-TTA threshold via Youden's J for binary balanced setting ---
+        # --- replace Youden's J with fixed 0.5 threshold ---
         if args.class_num == 2 and args.balanced:
-            # use ground-truth y_tar from this scope
-            fpr, tpr, th = roc_curve(y_tar, pre_y_pred[:,1])
-            best_pre_thresh = th[np.argmax(tpr - fpr)]
-            args.pre_thresh = float(best_pre_thresh)
-            logger.info(f"Calibrated Pre-TTA threshold: {best_pre_thresh:.3f}")
+            args.pre_thresh = 0.5
+            logger.info("Set Pre-TTA threshold to fixed 0.5")
             if hasattr(args, 'log'):
-                args.log.record(f"Calibrated Pre-TTA threshold: {best_pre_thresh:.3f}")
+                args.log.record("Set Pre-TTA threshold to fixed 0.5")
         # POST-TTA streaming adaptation
         adapted_model = copy.deepcopy(base_network).to(args.device)
         tta_score, tta_y_pred, _ = TTIME(loader_pre, adapted_model, args=args, balanced=args.balanced)
@@ -469,15 +463,12 @@ def train_target(args):
         np.savetxt(os.path.join(args.result_dir,
                     f"{args.data_name}_T-TIME_seed_{args.SEED}_pre_probs.csv"),
                    pre_y_pred, delimiter=",")
-        # --- calibrate Pre-TTA threshold via Youden's J for binary balanced setting ---
+        # --- replace Youden's J with fixed 0.5 threshold ---
         if args.class_num == 2 and args.balanced:
-            # use ground-truth y_tar from this scope
-            fpr, tpr, th = roc_curve(y_tar, pre_y_pred[:,1])
-            best_pre_thresh = th[np.argmax(tpr - fpr)]
-            args.pre_thresh = float(best_pre_thresh)
-            logger.info(f"Calibrated Pre-TTA threshold: {best_pre_thresh:.3f}")
+            args.pre_thresh = 0.5
+            logger.info("Set Pre-TTA threshold to fixed 0.5")
             if hasattr(args, 'log'):
-                args.log.record(f"Calibrated Pre-TTA threshold: {best_pre_thresh:.3f}")
+                args.log.record("Set Pre-TTA threshold to fixed 0.5")
         # POST-TTA streaming adaptation
         adapted_model = copy.deepcopy(base_network).to(args.device)
         tta_score, tta_y_pred, _ = TTIME(loader_pre, adapted_model, args=args, balanced=args.balanced)
@@ -515,9 +506,9 @@ if __name__ == '__main__':
         elif data_name == 'CustomEpoch':
             paradigm = 'MI'
             N = len(subject_names)  # number of unique prefixes/sessions
-            chn, class_num, time_sample_num, sample_rate = 31, 2, 1515, 200
+            chn, class_num, time_sample_num, sample_rate = 27, 2, 725, 100
             # F2 * (time_sample_num // 32)
-            feature_deep_dim = 1504
+            feature_deep_dim = 704
             # use actual total trials across all sessions
             import pandas as _pd
             trial_num = int(_pd.read_csv('./data/CustomEpoch/meta.csv')['n_trials'].sum())
