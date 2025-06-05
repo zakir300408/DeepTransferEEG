@@ -5,6 +5,7 @@ import numpy as np
 from step_1_load_data import load_custom_epoch_data
 from step_2_preprocess import preprocess_trial
 from step_3_load_setup_model import setup_inference_pipeline, infer_pre_tta, infer_tta
+from ttime_ensemble import SML  # add ensemble helper
 
 # pipeline constants
 DATASET_NAME = "CustomEpoch"
@@ -22,7 +23,7 @@ def main_pipeline():
 
     # Step 2: Preprocess Multiple Trials (at least 8 for TTA)
     print("\n--- Step 2: Preprocess Multiple Trials ---")
-    num_trials = min(120, len(X))  # Test with 12 trials (more than minimum 8)
+    num_trials = min(60, len(X))  # Test with 8 trials (minimum 8)
     print(f"Processing first {num_trials} trials...")
     
     processed_trials = []
@@ -171,6 +172,69 @@ def main_pipeline():
                                      if tta_confs[i] >= args_tta.conf_thresh)
         print(f"  Actual adaptation opportunities: {adaptation_opportunities}")
         
+        # Step 6: Ensemble Across Seeds
+        print("\n--- Step 6: Ensemble Across Seeds ---")
+        SEEDS = [2,3,5,6,7,8,9,12]
+        all_pre, all_tta = [], []
+        for s in SEEDS:
+            # setup pipelines for seed s
+            model_pre_s, R_pre_s, args_s, _ = setup_inference_pipeline(DATASET_NAME, 0, s, 'pre_tta')
+            (model_tta_s, opt_s, R_tta_s, data_cum_s), args_tta_s, _ = setup_inference_pipeline(DATASET_NAME, 0, s, 'tta')
+            pre_s, tta_s = [], []
+            for i in range(num_trials):
+                p_pre, R_pre_s = infer_pre_tta(
+                    model=model_pre_s,
+                    trial=processed_trials[i][:, :args_s.time_sample_num],
+                    args=args_s,
+                    R=R_pre_s,
+                    trial_idx=i
+                )
+                p_tta, R_tta_s, data_cum_s = infer_tta(
+                    model=model_tta_s,
+                    optimizer=opt_s,
+                    trial=processed_trials[i][:, :args_tta_s.time_sample_num],
+                    args=args_tta_s,
+                    R=R_tta_s,
+                    data_cum=data_cum_s,
+                    trial_idx=i
+                )
+                # collect class-1 probabilities
+                pre_s.append(p_pre[0,1])
+                tta_s.append(p_tta[0,1])
+            all_pre.append(pre_s)
+            all_tta.append(tta_s)
+
+        pre_arr = np.stack(all_pre)   # shape (n_seeds, num_trials)
+        tta_arr = np.stack(all_tta)
+
+        # ensemble votes
+        mean_pre = (pre_arr.mean(0)   > 0.5).astype(int)
+        med_pre  = (np.median(pre_arr,0)> 0.5).astype(int)
+        sml_pre  = SML(pre_arr)
+
+        mean_tta = (tta_arr.mean(0)   > 0.5).astype(int)
+        med_tta  = (np.median(tta_arr,0)> 0.5).astype(int)
+        sml_tta  = SML(tta_arr)
+
+        acc = lambda pred: (pred == true_labels).mean() * 100
+        print(f"Ensemble Pre-TTA Acc: Mean={acc(mean_pre):.1f}%, Median={acc(med_pre):.1f}%, SML={acc(sml_pre):.1f}%")
+        print(f"Ensemble    TTA Acc: Mean={acc(mean_tta):.1f}%, Median={acc(med_tta):.1f}%, SML={acc(sml_tta):.1f}%")
+
+        # Per-trial ensemble predictions
+        print(f"\n--- Step 7: Ensemble Per-Trial Predictions on {num_trials} Trials ---")
+        print("Trial | True | Pre-Mean | Pre-Median | Pre-SML | TTA-Mean | TTA-Median | TTA-SML")
+        print("-" * 85)
+        for trial_idx in range(num_trials):
+            true_lbl = true_labels[trial_idx]
+            pm = mean_pre[trial_idx]
+            pmed = med_pre[trial_idx]
+            psml = sml_pre[trial_idx]
+            tm = mean_tta[trial_idx]
+            tmed = med_tta[trial_idx]
+            tsml = sml_tta[trial_idx]
+            print(f"{trial_idx:5d} | {true_lbl:4d} | {pm:8d} | {pmed:10d} | {psml:7d} | "
+                  f"{tm:9d} | {tmed:11d} | {tsml:6d}")
+
     except Exception as e:
         print(f"Model loading/prediction failed: {e}")
         import traceback
