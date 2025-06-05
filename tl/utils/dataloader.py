@@ -178,7 +178,7 @@ def data_process_secondsession(dataset):
         meta = pd.read_csv('./data/CustomEpoch/meta.csv')
         num_subjects = len(meta)       # number of sessions
         paradigm     = 'MI'
-        sample_rate  = 200             # Hz, as set in dnn.py
+        sample_rate  = 100             # Hz, as set in dnn.py
         ch_num       = X.shape[1]      # channels
         # apply 8–32 Hz bandpass then 50 Hz notch in one go:
         nyq = sample_rate / 2

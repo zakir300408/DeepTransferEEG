@@ -55,10 +55,15 @@ class Net_ln2(nn.Module):
         self.fc2 = nn.Linear(n_hidden, bottleneck_dim)
         self.fc2.apply(init_weights)
         self.ln2 = nn.LayerNorm(bottleneck_dim)
+        # added extra layer for capacity
+        self.fc3 = nn.Linear(bottleneck_dim, bottleneck_dim)
+        self.fc3.apply(init_weights)
+        self.ln3 = nn.LayerNorm(bottleneck_dim)
 
     def forward(self, x):
         x = self.act(self.ln1(self.fc1(x)))
         x = self.act(self.ln2(self.fc2(x)))
+        x = self.act(self.ln3(self.fc3(x)))
         x = x.view(x.size(0), -1)
         return x
 
@@ -68,16 +73,24 @@ class Net_CFE(nn.Module):
         if input_dim < 256:
             print('\nwarning', 'input_dim < 256')
         super(Net_CFE, self).__init__()
+        # widened + batchnorm + dropout
         self.module = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            # nn.BatchNorm1d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True),
-            nn.LeakyReLU(negative_slope=0.01, inplace=True),
+            nn.Linear(input_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.LeakyReLU(0.01, inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(0.01, inplace=True),
+            nn.Dropout(0.5),
             nn.Linear(256, 128),
-            # nn.BatchNorm1d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True),
-            nn.LeakyReLU(negative_slope=0.01, inplace=True),
-            nn.Linear(128, bottleneck_dim),  # default 64
-            # nn.BatchNorm1d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True),
-            nn.LeakyReLU(negative_slope=0.01, inplace=True),
+            nn.BatchNorm1d(128),
+            nn.LeakyReLU(0.01, inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(128, bottleneck_dim),
+            nn.BatchNorm1d(bottleneck_dim),
+            nn.LeakyReLU(0.01, inplace=True),
+            nn.Dropout(0.5),
         )
 
     def forward(self, x):
@@ -155,15 +168,17 @@ def grl_hook(coeff):
 class Discriminator(nn.Module):
     def __init__(self, input_dim=2048, hidden_dim=2048):
         super(Discriminator, self).__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
+        # 3-layer discriminator: 2048→1024→1
         self.ln1 = nn.Linear(input_dim, hidden_dim)
-        self.bn = nn.BatchNorm1d(hidden_dim)
-        self.ln2 = nn.Linear(hidden_dim, 1)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.ln2 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.bn2 = nn.BatchNorm1d(hidden_dim // 2)
+        self.ln3 = nn.Linear(hidden_dim // 2, 1)
 
     def forward(self, x):
-        x = F.relu(self.ln1(x))
-        x = self.ln2(self.bn(x))
+        x = F.relu(self.bn1(self.ln1(x)))
+        x = F.relu(self.bn2(self.ln2(x)))
+        x = self.ln3(x)
         y = tr.sigmoid(x)
         return y
 
@@ -173,12 +188,13 @@ class AdversarialNetwork(nn.Module):
         super(AdversarialNetwork, self).__init__()
         self.ad_layer1 = nn.Linear(in_feature, hidden_size1)
         self.ad_layer2 = nn.Linear(hidden_size1, hidden_size2)
-        self.ad_layer3 = nn.Linear(hidden_size2, 1)
-        self.relu1 = nn.ReLU()
-        self.relu2 = nn.ReLU()
-        self.dropout1 = nn.Dropout(0.5)
-        self.dropout2 = nn.Dropout(0.5)
-        self.sigmoid = nn.Sigmoid()
+        # add a 4th hidden stage
+        hidden_size3 = hidden_size2 // 2
+        self.ad_layer3 = nn.Linear(hidden_size2, hidden_size3)
+        self.relu3 = nn.ReLU()
+        self.dropout3 = nn.Dropout(0.5)
+        self.ad_layer4 = nn.Linear(hidden_size3, 1)
+        self.sigmoid_out = nn.Sigmoid()
         self.apply(init_weights)
         self.iter_num = 0
         self.alpha = 10
@@ -196,8 +212,11 @@ class AdversarialNetwork(nn.Module):
         x = self.ad_layer2(x)
         x = self.relu2(x)
         x = self.dropout2(x)
-        y = self.ad_layer3(x)
-        y = self.sigmoid(y)
+        x = self.ad_layer3(x)
+        x = self.relu3(x)
+        x = self.dropout3(x)
+        y = self.ad_layer4(x)
+        y = self.sigmoid_out(y)
         return y
 
     def output_num(self):
