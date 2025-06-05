@@ -385,7 +385,7 @@ def initialize_network(args):
     return nn.Sequential(netF, netC).to(args.device)
 
 def zero_epoch_flow(args, base_net, X_src, y_src, X_tar, y_tar, idt_str, extra):
-    """Handle the args.max_epoch == 0 case: load checkpoint, do Pre-TTA (BN-reset + EA) & TTA."""
+    """Handle the args.max_epoch == 0 case: load checkpoint, do Pre-TTA (EA) & TTA."""
     # Load source checkpoint
     ckpt = f'./runs/{args.data_name}/{args.backbone}_S{idt_str}_seed{args.SEED}{extra}_best.ckpt'
     if not os.path.isfile(ckpt):
@@ -427,16 +427,16 @@ def zero_epoch_flow(args, base_net, X_src, y_src, X_tar, y_tar, idt_str, extra):
         batch_size=1, shuffle=False
     )
 
-    # --- BN-reset Pre-TTA + EA ---
+    # --- EA Pre-TTA ---
     adapt = copy.deepcopy(base_net).to(args.device)
-    adapt.apply(_reset_batchnorm)    # reset all BN running stats
+    # adapt.apply(_reset_batchnorm)    # reset all BN running stats
     adapt.eval()
 
     # compute and log Pre-TTA accuracy (with EA)
     pre_acc = cal_score_online(loader_pre, adapt, args=args)
-    metric  = "Acc" if args.balanced else "AUC"
-    logger.info(f"Pre-TTA IEA {metric} (BN-reset + EA) = {pre_acc:.2f}%")
-    args.log.record(f"Pre-TTA IEA {metric} (BN-reset + EA) = {pre_acc:.2f}%")
+    metric = "Acc" if args.balanced else "AUC"
+    logger.info(f"Pre-TTA EA {metric} = {pre_acc:.2f}%")
+    args.log.record(f"Pre-TTA EA {metric} = {pre_acc:.2f}%")
 
     # now **with** EA alignment
     bn_reset_probs = infer_probs(adapt, loader_pre, align=True)[:, 1]
@@ -512,13 +512,12 @@ def train_and_evaluate_flow(args, base_net, X_src, y_src, X_tar, y_tar, dset_loa
                 torch.save(base_net.state_dict(), ckpt_best)
             base_net.train()
 
-    # load best, then create fresh copy with BN reset like zero_epoch_flow does
+    # load best, then create fresh copy
     base_net.load_state_dict(torch.load(ckpt_best, map_location=args.device))
     logger.info(f"[CONFIRM] Loaded best model excludes targets {args.idt}")
     
-    # Create fresh copy and reset BN stats (same as zero_epoch_flow)
     fresh_net = copy.deepcopy(base_net).to(args.device)
-    fresh_net.apply(_reset_batchnorm)
+    # fresh_net.apply(_reset_batchnorm)  # BN reset skipped
     
     return zero_epoch_flow(args, fresh_net, X_src, y_src, X_tar, y_tar, idt_str, extra)
 
@@ -558,8 +557,8 @@ def get_dataset_params(data_name, subject_names, df_meta):
     elif data_name == 'CustomEpoch':
         paradigm = 'MI'
         N = len(subject_names)
-        chn, class_num, time_sample_num, sample_rate = 31, 2, 1515, 200
-        feature_deep_dim = 1504
+        chn, class_num, time_sample_num, sample_rate = 27, 2, 725, 100
+        feature_deep_dim = 704
         trial_num = int(df_meta['n_trials'].sum())
         return paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim
     else:
