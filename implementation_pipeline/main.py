@@ -9,7 +9,7 @@ from ttime_ensemble import SML  # add ensemble helper
 
 # pipeline constants
 DATASET_NAME = "CustomEpoch"
-SAMPLE_RATE  = 200
+SAMPLE_RATE  = 100
 
 def main_pipeline():
     print("Starting implementation pipeline...")

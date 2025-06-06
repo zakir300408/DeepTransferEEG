@@ -283,7 +283,7 @@ def setup_inference_pipeline(data_name, subject_id, seed=2, mode='tta'):
     args.SEED = seed
     args.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     args.backbone = 'EEGNet'
-    args.chn = 31  # Adjust based on your data
+    args.chn = 27  # Adjust based on your data
     args.time_sample_num = 1515  # Adjust based on your data
     args.class_num = 2  # Binary classification (add this missing attribute)
     args.feature_deep_dim = 1504  # Add this required attribute
@@ -295,7 +295,7 @@ def setup_inference_pipeline(data_name, subject_id, seed=2, mode='tta'):
     args.t = 1.7
     args.conf_thresh = 0.1
     args.epsilon = 1e-5
-    args.sample_rate = 200
+    args.sample_rate = 100
     idt_str = str(subject_id)
     
     if mode == 'pre_tta':
