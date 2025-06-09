@@ -287,14 +287,10 @@ def train_target(args):
 
     # load source/target
     # load source/target only once per subject
-    if not hasattr(args, 'mi_data_loaded'):
-        args.mi_data_loaded = read_mi_combine_tar(args)
-    X_src, y_src, X_tar, y_tar = args.mi_data_loaded
+    X_src, y_src, X_tar, y_tar = read_mi_combine_tar(args)
 
     # build / cache data loaders with EA applied only once per subject
-    if not hasattr(args, 'dset_loaders_cached'):
-        args.dset_loaders_cached = data_loader(X_src, y_src, X_tar, y_tar, args)
-    dset_loaders = args.dset_loaders_cached
+    dset_loaders = data_loader(X_src, y_src, X_tar, y_tar, args)
 
     # build per-session bounds for CustomEpoch
     if args.data == 'CustomEpoch':
@@ -506,9 +502,9 @@ if __name__ == '__main__':
         elif data_name == 'CustomEpoch':
             paradigm = 'MI'
             N = len(subject_names)  # number of unique prefixes/sessions
-            chn, class_num, time_sample_num, sample_rate = 27, 2, 725, 100
+            chn, class_num, time_sample_num, sample_rate = 10, 2, 1515, 200
             # F2 * (time_sample_num // 32)
-            feature_deep_dim = 704
+            feature_deep_dim = 1504
             # use actual total trials across all sessions
             import pandas as _pd
             trial_num = int(_pd.read_csv('./data/CustomEpoch/meta.csv')['n_trials'].sum())
@@ -527,7 +523,7 @@ if __name__ == '__main__':
             max_epoch = 30
 
         # learning rate
-        lr = 0.0005
+        lr = 0.001
 
         # max_tta: maximum sliding‐window size for TTA
         max_tta = 8
@@ -619,12 +615,8 @@ if __name__ == '__main__':
             target_str = subject_names[idt]
             idts = [i for i, fn in enumerate(files) if fn.split('_')[0] == target_str]
             args.idt = idts
-            # Pre-load and cache subject data once per subject iteration
-            if not hasattr(args, 'mi_data_loaded'):
-                args.mi_data_loaded = read_mi_combine_tar(args)
-            else:
-                # refresh cache for the changed subject idt
-                args.mi_data_loaded = read_mi_combine_tar(args)
+            # always reload subject data to avoid stale cache
+            args.mi_data_loaded = read_mi_combine_tar(args)
             # use prefix names
             others = subject_names.copy()
             others.pop(idt)
