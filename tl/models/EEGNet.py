@@ -149,4 +149,3 @@ class EEGNet_feature(nn.Module):
         output = self.block2(output)
         output = output.reshape(output.size(0), -1)
         return output
-

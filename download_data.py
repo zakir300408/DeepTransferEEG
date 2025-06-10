@@ -53,7 +53,7 @@ def dataset_to_file(dataset_name, data_save):
             raw_X = mat['MyEpoch']               # (n_trials, samples, channels)
             orig_samples = raw_X.shape[1]
             X = raw_X.transpose(0, 2, 1)         # to (n_trials, channels, samples)
-            # ignore first 1.5s and last 2.5s of each epoch
+            # ignore
             ignore_start = int(IGNORE_START_SECONDS_CUSTOM * SAMPLE_RATE_CUSTOM)
             ignore_end   = int(IGNORE_END_SECONDS_CUSTOM   * SAMPLE_RATE_CUSTOM)
             X = X[:, :, ignore_start:-ignore_end]

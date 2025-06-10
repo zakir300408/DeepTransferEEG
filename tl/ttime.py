@@ -504,7 +504,7 @@ if __name__ == '__main__':
             N = len(subject_names)  # number of unique prefixes/sessions
             chn, class_num, time_sample_num, sample_rate = 10, 2, 1515, 200
             # feature dimension = F2 * (time_sample_num // 32)
-            feature_deep_dim = 752
+            feature_deep_dim = 470
             # use actual total trials across all sessions
             import pandas as _pd
             trial_num = int(_pd.read_csv('./data/CustomEpoch/meta.csv')['n_trials'].sum())
