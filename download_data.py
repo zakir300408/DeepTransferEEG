@@ -58,9 +58,18 @@ def dataset_to_file(dataset_name, data_save):
             ignore_end   = int(IGNORE_END_SECONDS_CUSTOM   * SAMPLE_RATE_CUSTOM)
             X = X[:, :, ignore_start:-ignore_end]
 
-            # NEW: keep only selected channels
+            # keep only selected channels
             X = X[:, _KEEP_IDX, :]
             print(f"Kept channels {KEEP_CHANNELS}, new shape {X.shape}")
+
+            # sanity check: for the first session only, print channel, idx, subject and session
+            if len(all_X) == 0:
+                session_name = os.path.basename(fn)
+                subject = session_name.split('_')[0]
+                first_vals = X[0, :, 0]  # trial 0, all kept channels, sample 0
+                print("Sanity check (first session): first sample values per kept channel:")
+                for ch, idx0, v in zip(KEEP_CHANNELS, _KEEP_IDX, first_vals):
+                    print(f"  {ch} (idx {idx0}, subject {subject}, session {session_name}): {v}")
 
             y = mat['MyLabel'].flatten()
             all_X.append(X)
