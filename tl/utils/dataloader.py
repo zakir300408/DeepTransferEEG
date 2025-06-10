@@ -42,14 +42,6 @@ def data_process(dataset):
         sample_rate  = 200
         ch_num       = X.shape[1]
 
-        # apply 50 Hz notch and 8–32 Hz bandpass in one go:
-        nyq = sample_rate / 2
-        bn, an = iirnotch(50.0/nyq, 30.0)
-        b, a   = butter(5, [8/nyq, 32/nyq], btype='band')
-        # vectorized filtering over time‐axis
-        X = filtfilt(bn, an, X, axis=2)
-        X = filtfilt(b, a,   X, axis=2)
-
         # ========== NEW: compute time-frequency features in parallel ==========
         nperseg, noverlap = 128, 64
         # get freq/time dims
@@ -66,10 +58,10 @@ def data_process(dataset):
         tf_flat = tf_feats.reshape(X.shape[0], X.shape[1], -1)
         X = np.concatenate([X, tf_flat], axis=2)
         # ===========================================================
-        
+        X = (X - X.mean(axis=2, keepdims=True)) / (X.std(axis=2, keepdims=True) + 1e-8)
         y = preprocessing.LabelEncoder().fit_transform(y)
         # normalize each channel of each trial over time
-        X = (X - X.mean(axis=2, keepdims=True)) / (X.std(axis=2, keepdims=True) + 1e-8)
+        
         print('data shape:', X.shape, ' labels shape:', y.shape)
         return X, y, num_subjects, paradigm, sample_rate, ch_num
 

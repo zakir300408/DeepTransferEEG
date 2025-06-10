@@ -2,6 +2,7 @@ import os
 import time
 import glob
 from scipy.io import loadmat
+from scipy.signal import butter, filtfilt, iirnotch         # add these
 import pandas as pd
 import numpy as np
 import moabb
@@ -102,6 +103,16 @@ def dataset_to_file(dataset_name, data_save):
                     if attempt == MAX_RETRIES:
                         raise
                     time.sleep(RETRY_DELAY)
+        # ========= NEW: for CustomEpoch, apply 50Hz notch + 8–32Hz bandpass + z-score =========
+        if dataset_name == 'CustomEpoch':
+            nyq = SAMPLE_RATE_CUSTOM / 2
+            bn, an = iirnotch(50.0/nyq, 30.0)
+            b, a   = butter(5, [8/nyq, 32/nyq], btype='band')
+            X = filtfilt(bn, an, X, axis=2)
+            X = filtfilt(b, a,   X, axis=2)
+            X = (X - X.mean(axis=2, keepdims=True)) / (X.std(axis=2, keepdims=True) + 1e-8)
+        # ================================================================================
+
         # display counts for all datasets
         ar_unique, cnts = np.unique(labels, return_counts=True)
         print("labels:", ar_unique)
