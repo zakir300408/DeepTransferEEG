@@ -18,11 +18,11 @@ def backbone_net(args, return_type='y'):
         Chans=args.chn,
         Samples=args.time_sample_num,
         kernLenght=int(args.sample_rate // 2),
-        F1=16,    # increased from 4 → 8
-        D=4,     # increased from 2 → 4
-        F2=32,   # increased from 8 → 16
+        F1=8,    # increased from 4 → 8
+        D=2,     # increased from 2 → 4
+        F2=16,   # increased from 8 → 16
         dropoutRate=0.5,
-        norm_rate=0.5
+        norm_rate=0.25
     )
     if return_type == 'y':
         netC = FC(args.feature_deep_dim, args.class_num)

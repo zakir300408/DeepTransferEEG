@@ -503,8 +503,8 @@ if __name__ == '__main__':
             paradigm = 'MI'
             N = len(subject_names)  # number of unique prefixes/sessions
             chn, class_num, time_sample_num, sample_rate = 10, 2, 1515, 200
-            # F2 * (time_sample_num // 32)
-            feature_deep_dim = 1504
+            # feature dimension = F2 * (time_sample_num // 32)
+            feature_deep_dim = 752
             # use actual total trials across all sessions
             import pandas as _pd
             trial_num = int(_pd.read_csv('./data/CustomEpoch/meta.csv')['n_trials'].sum())
@@ -520,7 +520,7 @@ if __name__ == '__main__':
             max_epoch = 0
         else:
             # training epochs
-            max_epoch = 30
+            max_epoch = 50
 
         # learning rate
         lr = 0.001
