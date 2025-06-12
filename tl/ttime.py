@@ -502,7 +502,7 @@ if __name__ == '__main__':
         elif data_name == 'CustomEpoch':
             paradigm = 'MI'
             N = len(subject_names)  # number of unique prefixes/sessions
-            chn, class_num, time_sample_num, sample_rate, feature_deep_dim = 31, 2, 1515, 200, 376
+            chn, class_num, time_sample_num, sample_rate, feature_deep_dim = 31, 2, 1515, 200, 1504
             trial_num = int(pd.read_csv('./data/CustomEpoch/meta.csv')['n_trials'].sum())
         else:
             raise ValueError(f"Unknown data_name {data_name}")

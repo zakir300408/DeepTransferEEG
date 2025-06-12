@@ -17,9 +17,9 @@ def backbone_net(args, return_type='y'):
                         Chans=args.chn,
                         Samples=args.time_sample_num,
                         kernLenght=int(args.sample_rate // 2),
-                        F1=4,
-                        D=2,
-                        F2=8,
+                        F1=16,
+                        D=4,
+                        F2=32,
                         dropoutRate=0.1,
                         norm_rate=0.1)
     #calculate the feature dimension automatically
