@@ -557,8 +557,8 @@ def get_dataset_params(data_name, subject_names, df_meta):
     elif data_name == 'CustomEpoch':
         paradigm = 'MI'
         N = len(subject_names)
-        chn, class_num, time_sample_num, sample_rate = 27, 2, 725, 100
-        feature_deep_dim = 704
+        chn, class_num, time_sample_num, sample_rate = 31, 2, 1515, 200
+        feature_deep_dim = 1504
         trial_num = int(df_meta['n_trials'].sum())
         return paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim
     else:
@@ -567,9 +567,9 @@ def get_dataset_params(data_name, subject_names, df_meta):
 
 def build_hyperparam_grid():
     return {
-        't':       [1.5, 1.7, 1.9, 2.0],
-        'lr':      [0.0001, 0.0005],
-        'steps':   [1, 3],
+        't':       [1.5],
+        'lr':      [0.0005],
+        'steps':   [1],
     }
 
 
@@ -590,10 +590,10 @@ def build_base_args(data_name, paradigm, N, chn, class_num,
     args.backbone         = 'EEGNet'
     args.batch_size       = 128
     args.align            = True
-    args.use_pretrained_model = True
+    args.use_pretrained_model = False
     args.balanced         = True
     args.calc_time        = False
-    args.max_parallel_seeds = 4
+    args.max_parallel_seeds = 1
     # Fixed hyperparameters
     args.max_tta          = 8
     args.stride           = 1

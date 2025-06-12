@@ -39,7 +39,7 @@ def data_process(dataset):
         meta = pd.read_csv('./data/CustomEpoch/meta.csv')
         num_subjects = len(meta)
         paradigm     = 'MI'
-        sample_rate  = 100
+        sample_rate  = 200
         ch_num       = X.shape[1]
 
         # apply 50 Hz notch and 8–32 Hz bandpass in one go:
@@ -69,7 +69,7 @@ def data_process(dataset):
         
         y = preprocessing.LabelEncoder().fit_transform(y)
         # normalize each channel of each trial over time
-        X = (X - X.mean(axis=2, keepdims=True)) / (X.std(axis=2, keepdims=True) + 1e-8)
+        X = (X - np.median(X, axis=2, keepdims=True)) / (np.std(X, axis=2, keepdims=True) + 1e-8)
         print('data shape:', X.shape, ' labels shape:', y.shape)
         return X, y, num_subjects, paradigm, sample_rate, ch_num
 
