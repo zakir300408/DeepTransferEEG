@@ -34,7 +34,6 @@ def data_process(dataset):
         # load concatenated epochs and labels (already first-session only)
         X = np.load('./data/CustomEpoch/X.npy')
         y = np.load('./data/CustomEpoch/labels.npy')
-        print('CustomEpoch data:', X.shape, y.shape)
         # count subjects from meta.csv
         meta = pd.read_csv('./data/CustomEpoch/meta.csv')
         num_subjects = len(meta)
@@ -42,7 +41,7 @@ def data_process(dataset):
         sample_rate  = 200
         ch_num       = X.shape[1]
 
-        # ========== NEW: compute time-frequency features in parallel ==========
+        # # ========== NEW: compute time-frequency features in parallel ==========
         nperseg, noverlap = 128, 64
         # get freq/time dims
         _, _, S0 = spectrogram(X[0,0], fs=sample_rate, nperseg=nperseg, noverlap=noverlap)
@@ -59,10 +58,9 @@ def data_process(dataset):
         X = np.concatenate([X, tf_flat], axis=2)
         # ===========================================================
         X = (X - X.mean(axis=2, keepdims=True)) / (X.std(axis=2, keepdims=True) + 1e-8)
-        y = preprocessing.LabelEncoder().fit_transform(y)
         # normalize each channel of each trial over time
         
-        print('data shape:', X.shape, ' labels shape:', y.shape)
+        print('CustomEpoch data:', X.shape, y.shape)
         return X, y, num_subjects, paradigm, sample_rate, ch_num
 
     if dataset == 'BNCI2014001':

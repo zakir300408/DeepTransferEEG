@@ -28,7 +28,7 @@ import sys
 import time
 from torch.utils.data import DataLoader, TensorDataset
 import logging
-
+import pandas as pd
 # ── Logger setup ──────────────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -502,12 +502,8 @@ if __name__ == '__main__':
         elif data_name == 'CustomEpoch':
             paradigm = 'MI'
             N = len(subject_names)  # number of unique prefixes/sessions
-            chn, class_num, time_sample_num, sample_rate = 10, 2, 1515, 200
-            # feature dimension = F2 * (time_sample_num // 32)
-            feature_deep_dim = 470
-            # use actual total trials across all sessions
-            import pandas as _pd
-            trial_num = int(_pd.read_csv('./data/CustomEpoch/meta.csv')['n_trials'].sum())
+            chn, class_num, time_sample_num, sample_rate, feature_deep_dim = 31, 2, 1515, 200, 376
+            trial_num = int(pd.read_csv('./data/CustomEpoch/meta.csv')['n_trials'].sum())
         else:
             raise ValueError(f"Unknown data_name {data_name}")
 
