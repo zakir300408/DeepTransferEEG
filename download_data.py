@@ -133,9 +133,6 @@ def dataset_to_file(dataset_name, data_save):
             b, a    = butter(5, [8/nyq, 32/nyq], btype='band')
             X       = filtfilt(bn, an, X, axis=2)
             X       = filtfilt(b, a,   X, axis=2)
-            # z-score
-            X       = (X - X.mean(axis=2, keepdims=True)) / (X.std(axis=2, keepdims=True) + 1e-8)
-
             # drop 1 s front AND 3 s end
             i0 = int(IGNORE_START_SECONDS_CUSTOM * SAMPLE_RATE_CUSTOM)
             i1 = int(IGNORE_END_SECONDS_CUSTOM   * SAMPLE_RATE_CUSTOM)

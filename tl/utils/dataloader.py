@@ -57,8 +57,8 @@ def data_process(dataset):
         tf_flat = tf_feats.reshape(X.shape[0], X.shape[1], -1)
         X = np.concatenate([X, tf_flat], axis=2)
         # ===========================================================
-        X = (X - X.mean(axis=2, keepdims=True)) / (X.std(axis=2, keepdims=True) + 1e-8)
         # normalize each channel of each trial over time
+        X = (X - np.median(X, axis=2, keepdims=True)) / (np.std(X, axis=2, keepdims=True) + 1e-8)
         
         print('CustomEpoch data:', X.shape, y.shape)
         return X, y, num_subjects, paradigm, sample_rate, ch_num

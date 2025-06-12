@@ -516,10 +516,10 @@ if __name__ == '__main__':
             max_epoch = 0
         else:
             # training epochs
-            max_epoch = 50
+            max_epoch = 30
 
         # learning rate
-        lr = 0.001
+        lr = 0.0005
 
         # max_tta: maximum sliding‐window size for TTA
         max_tta = 8
