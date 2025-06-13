@@ -21,9 +21,7 @@ SAMPLE_RATE_CUSTOM          = 200
 
 # define your fixed augmentation windows (start_s, end_s)
 AUG_WINDOWS_S = [
-    (1.5, 5.5),
     (2.0, 6.0),
-    (2.5, 6.5)
 ]
 
 CH_NAMES = [
@@ -105,9 +103,6 @@ def dataset_to_file(dataset_name, data_save):
         labels = np.concatenate(all_y, axis=0)
         meta   = pd.DataFrame(meta_rows)
 
-    else:
-        raise ValueError(f"Unknown dataset {dataset_name}")
-
     # ---- preprocess and save branch ----
     if data_save:
         print(f'preparing {dataset_name} data...')
@@ -127,16 +122,7 @@ def dataset_to_file(dataset_name, data_save):
                     time.sleep(RETRY_DELAY)
 
         if dataset_name == 'CustomEpoch':
-            # notch & bandpass
-            nyq     = SAMPLE_RATE_CUSTOM / 2
-            bn, an  = iirnotch(50.0/nyq, 30.0)
-            b, a    = butter(5, [8/nyq, 32/nyq], btype='band')
-            X       = filtfilt(bn, an, X, axis=2)
-            X       = filtfilt(b, a,   X, axis=2)
-            # drop 1 s front AND 3 s end
-            i0 = int(IGNORE_START_SECONDS_CUSTOM * SAMPLE_RATE_CUSTOM)
-            i1 = int(IGNORE_END_SECONDS_CUSTOM   * SAMPLE_RATE_CUSTOM)
-            X  = X[:, :, i0:-i1]
+
 
             # apply fixed-window augmentation
             X, labels = augment_defined_windows(

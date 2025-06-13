@@ -45,7 +45,7 @@ def TTIME(loader, model, args, balanced=True):
     # IEEE Transactions on Biomedical Engineering
     # Note that the ensemble experiment is separately implemented in ttime_ensemble.py, using recorded test prediction.
 
-    if balanced == False and args.data_name == 'BNCI2014001-4':
+    if balanced == False and args.data_name == 'BNCI2014001':
         logger.error('ERROR, imbalanced multi-class not implemented')
         sys.exit(0)
 
@@ -64,71 +64,55 @@ def TTIME(loader, model, args, balanced=True):
         c = 4
 
     iter_test = iter(loader)
-
-    # Initialize data_cum before the loop
-    data_cum = None
     # loop through test data stream one by one
     for i in range(len(loader)):
         #################### Phase 1: target label prediction ####################
-        # time data loading & prep
-        dl_start = time.time()
         model.eval()
         data = next(iter_test)
-        # inputs→data_cum→sample_test prep
-        inputs, labels = data[0], data[1]
-        inputs = inputs.reshape(1,1,inputs.shape[-2],inputs.shape[-1]).to(args.device)
+        inputs = data[0]
+        labels = data[1]
+        inputs = inputs.reshape(1, 1, inputs.shape[-2], inputs.shape[-1]).cpu()
 
-        # accumulate test data ON‐DEVICE (no .cpu())
-        if data_cum is None:
-            data_cum = inputs.float()
+        # accumulate test data
+        if i == 0:
+            data_cum = inputs.float().cpu()
         else:
-            data_cum = torch.cat((data_cum, inputs.float()), 0)
-        # keep only last max_tta samples on GPU to avoid unbounded growth
-        max_win = args.max_tta
-        if data_cum.size(0) > max_win:
-            data_cum = data_cum[-max_win:]
+            data_cum = torch.cat((data_cum, inputs.float().cpu()), 0)
 
         if args.align:
-            # time EA (incremental alignment)
-            ea_start = time.time()
-            # get sample as a GPU tensor
-            # only use the most recent sample for alignment
-            sample_tensor = data_cum[-1].reshape(args.chn, args.time_sample_num)
-            # update R on CPU via EA_online
-            sample_np = sample_tensor.cpu().numpy()
-            R = EA_online(sample_np, R, i)
-            # compute R^(-0.5) on GPU via eigendecomp
-            R_t = torch.from_numpy(R).to(device=args.device, dtype=sample_tensor.dtype)
-            eigvals, eigvecs = LA.eigh(R_t)
-            sqrtRefEA = eigvecs @ torch.diag(eigvals.pow(-0.5)) @ eigvecs.T
-            # apply transform on GPU
-            sample_tensor = sqrtRefEA @ sample_tensor
-            # reshape into batch
-            sample_test = sample_tensor.reshape(1,1,args.chn,args.time_sample_num)
-            # log EA time
-            torch.cuda.synchronize() if args.device.type=='cuda' else None
-            ea_ms = (time.time() - ea_start)*1000
-            logger.debug(f"[T-TIME] iter {i}: EA_online + transform took {ea_ms:.1f} ms")
-        else:
-            # no alignment: just slice ON‐DEVICE
-            sample_test = data_cum[i].unsqueeze(0)  # now (1,1,chn,time)
+            start_time = time.time()
+            # original logic: pick the i-th accumulated sample
+            if i == 0:
+                sample_test = data_cum.reshape(args.chn, args.time_sample_num)
+            else:
+                sample_test = data_cum[i].reshape(args.chn, args.time_sample_num)
+            # update reference matrix
+            R = EA_online(sample_test, R, i)
 
-        # ensure tensor is float32 on correct device
-        sample_test = sample_test.to(device=args.device, dtype=torch.float32)
-        # log data‐loading & prep time
-        dl_ms = (time.time() - dl_start)*1000
-        logger.debug(f"[T-TIME] iter {i}: data load & prep took {dl_ms:.1f} ms")
+            sqrtRefEA = fractional_matrix_power(R, -0.5)
+            # transform current test sample
+            sample_test = np.dot(sqrtRefEA, sample_test)
+
+            EA_time = time.time()
+            if args.calc_time:
+                print('sample ', str(i), ', pre-inference IEA finished time in ms:', np.round((EA_time - start_time) * 1000, 3))
+            sample_test = sample_test.reshape(1, 1, args.chn, args.time_sample_num)
+        else:
+            sample_test = data_cum[i].numpy()
+            sample_test = sample_test.reshape(1, 1, sample_test.shape[1], sample_test.shape[2])
+
+        if args.data_env != 'local':
+            sample_test = torch.from_numpy(sample_test).to(torch.float32).cuda()
+        else:
+            sample_test = torch.from_numpy(sample_test).to(torch.float32)
 
         _, outputs = model(sample_test)
 
         softmax_out = nn.Softmax(dim=1)(outputs)
+
         outputs = outputs.float().cpu()
         labels = labels.float().cpu()
         _, predict = torch.max(outputs, 1)
-
-        # logger.info(f"Trial {i}: pred={predict.item()}, gt={labels.item()}")
-        # if hasattr(args, 'log'):
-        #     args.log.record(f"Trial {i}: pred={predict.item()}, gt={labels.item()}")
 
         y_pred.append(softmax_out.detach().cpu().numpy())
         y_true.append(labels.item())
@@ -519,10 +503,10 @@ if __name__ == '__main__':
             max_epoch = 30
 
         # learning rate
-        lr = 0.0005
+        lr = 0.001
 
         # max_tta: maximum sliding‐window size for TTA
-        max_tta = 8
+        max_tta = 20
 
         # update step
         steps = 1
@@ -597,7 +581,7 @@ if __name__ == '__main__':
         logger.addHandler(file_handler)
 
         # Initialize storage for results
-        seeds = [2, 3, 5, 6,7,8,9,11,12]
+        seeds = [2, 3]
         total_acc = np.zeros((len(seeds), N))
         pre_acc_all_seeds = np.zeros((len(seeds), N))
         ensemble_tta_all = []

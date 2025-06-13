@@ -41,7 +41,14 @@ def data_process(dataset):
         sample_rate  = 200
         ch_num       = X.shape[1]
 
-        # # ========== NEW: compute time-frequency features in parallel ==========
+        # notch & bandpass
+        nyq     = sample_rate / 2
+        bn, an  = iirnotch(50.0/nyq, 30.0)
+        b, a    = butter(5, [8/nyq, 32/nyq], btype='band')
+        X       = filtfilt(bn, an, X, axis=2)
+        X       = filtfilt(b, a,   X, axis=2)
+
+        # # # ========== NEW: compute time-frequency features in parallel ==========
         nperseg, noverlap = 128, 64
         # get freq/time dims
         _, _, S0 = spectrogram(X[0,0], fs=sample_rate, nperseg=nperseg, noverlap=noverlap)
