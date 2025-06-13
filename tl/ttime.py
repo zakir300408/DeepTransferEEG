@@ -886,7 +886,7 @@ def main():
         base_args = build_base_args(
             data_name, paradigm, N, chn, class_num, tsn, sr, tn, fdd
         )
-        seeds = [2,3,5,6,7,8,9,12]
+        seeds = [2,3]
 
         for hp_values in product(*grid.values()):
             hp = dict(zip(grid.keys(), hp_values))
