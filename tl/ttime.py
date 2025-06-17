@@ -557,8 +557,8 @@ def get_dataset_params(data_name, subject_names, df_meta):
     elif data_name == 'CustomEpoch':
         paradigm = 'MI'
         N = len(subject_names)
-        chn, class_num, time_sample_num, sample_rate = 27, 2, 1515, 200
-        feature_deep_dim = 1504
+        chn, class_num, time_sample_num, sample_rate = 27, 2, 725, 200
+        feature_deep_dim = 704
         trial_num = int(df_meta['n_trials'].sum())
         return paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim
     else:
@@ -611,7 +611,7 @@ def setup_run(args, data_name, hp):
     # prepare a concise task identifier used for log filenames
     args.task_str = f"mtta{args.max_tta}_str{args.stride}_t{args.t}_lr{args.lr}_st{args.steps}"
     # epochs
-    args.max_epoch = 0 if args.use_pretrained_model else 30
+    args.max_epoch = 0 if args.use_pretrained_model else 50
 
     # paths
     args.data      = data_name
@@ -886,7 +886,7 @@ def main():
         base_args = build_base_args(
             data_name, paradigm, N, chn, class_num, tsn, sr, tn, fdd
         )
-        seeds = [2,3]
+        seeds = [2,3,4,5]
 
         for hp_values in product(*grid.values()):
             hp = dict(zip(grid.keys(), hp_values))
