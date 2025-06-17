@@ -23,11 +23,6 @@ from utils.loss import Entropy
 
 from tl.ttime import TTIME
 
-def _reset_batchnorm(m):
-    """Reset BatchNorm running statistics"""
-    if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-        m.reset_running_stats()
-
 def load_pretrained_model(args, idt_str, extra=""):
     """
     Load pre-trained source model checkpoint
