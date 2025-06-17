@@ -19,6 +19,17 @@ IGNORE_START_SECONDS_CUSTOM = 2
 IGNORE_END_SECONDS_CUSTOM   = 2
 SAMPLE_RATE_CUSTOM = 200
 
+CH_NAMES = [
+    'FP1','FZ','F3','F7','FT7','FC5','FC1','C3','T7','TP7','CP5','CP1','PZ',
+    'P3','P7','O1','O2','P4','P8','TP8','CP6','CP2','CZ','C4','T8','FT8',
+    'FC6','FC2','F4','F8','FP2'
+]
+# drop these four channels
+DROP_CHANNELS = ['FT7','TP7','TP8','FT8']
+# keep all others
+KEEP_CHANNELS = [ch for ch in CH_NAMES if ch not in DROP_CHANNELS]
+_KEEP_IDX = [CH_NAMES.index(ch) for ch in KEEP_CHANNELS]
+
 
 def dataset_to_file(dataset_name, data_save):
     moabb.set_log_level("ERROR")
@@ -45,13 +56,15 @@ def dataset_to_file(dataset_name, data_save):
             raw_X = mat['MyEpoch']               # (n_trials, samples, channels)
             orig_samples = raw_X.shape[1]
             X = raw_X.transpose(0, 2, 1)         # to (n_trials, channels, samples)
-            # ignore first 1.5s and last 2.5s of each epoch
+            # ignore first 2s and last 2s of each epoch
             ignore_start = int(IGNORE_START_SECONDS_CUSTOM * SAMPLE_RATE_CUSTOM)
             ignore_end   = int(IGNORE_END_SECONDS_CUSTOM   * SAMPLE_RATE_CUSTOM)
             X = X[:, :, ignore_start:-ignore_end]
+            # keep only specified channels
+            X = X[:, _KEEP_IDX, :]
             # print samples before and after truncation
             print(f"{os.path.basename(fn)}: original samples per trial = {orig_samples}, "
-                  f"after truncation = {X.shape[2]}")
+                  f"after truncation = {X.shape[2]}, kept channels = {len(_KEEP_IDX)}")
             y = mat['MyLabel'].flatten()
             all_X.append(X)
             all_y.append(y)
