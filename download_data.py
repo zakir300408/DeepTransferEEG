@@ -5,7 +5,6 @@ from scipy.io import loadmat
 import pandas as pd
 import numpy as np
 import moabb
-from scipy.signal import decimate
 
 from moabb.datasets import BNCI2014001, BNCI2014002, BNCI2015001
 from moabb.paradigms import MotorImagery, P300
@@ -25,18 +24,11 @@ CH_NAMES = [
     'P3','P7','O1','O2','P4','P8','TP8','CP6','CP2','CZ','C4','T8','FT8',
     'FC6','FC2','F4','F8','FP2'
 ]
+# drop these four channels
 DROP_CHANNELS = ['FT7','TP7','TP8','FT8']
-_DROP_IDX = [CH_NAMES.index(ch) for ch in DROP_CHANNELS]
-_KEEP_IDX = [i for i in range(len(CH_NAMES)) if i not in _DROP_IDX]
-
-# new helper: use SciPy decimate for anti-alias filtering + downsampling
-def downsample_epochs(X, decimation_factor=2):
-    """
-    Downsample a 3D array (trials, channels, samples) by filtering
-    and picking every decimation_factor-th sample along the last axis.
-    """
-    # axis=2 is the time dimension
-    return decimate(X, q=decimation_factor, axis=2, ftype='iir')
+# keep all others
+KEEP_CHANNELS = [ch for ch in CH_NAMES if ch not in DROP_CHANNELS]
+_KEEP_IDX = [CH_NAMES.index(ch) for ch in KEEP_CHANNELS]
 
 
 def dataset_to_file(dataset_name, data_save):
@@ -64,21 +56,15 @@ def dataset_to_file(dataset_name, data_save):
             raw_X = mat['MyEpoch']               # (n_trials, samples, channels)
             orig_samples = raw_X.shape[1]
             X = raw_X.transpose(0, 2, 1)         # to (n_trials, channels, samples)
-            # ignore first 1.5s and last 2.5s of each epoch
+            # ignore first 2s and last 2s of each epoch
             ignore_start = int(IGNORE_START_SECONDS_CUSTOM * SAMPLE_RATE_CUSTOM)
             ignore_end   = int(IGNORE_END_SECONDS_CUSTOM   * SAMPLE_RATE_CUSTOM)
             X = X[:, :, ignore_start:-ignore_end]
-
-            # NEW: downsample from 200Hz → 100Hz
-            before = X.shape[2]
-            X = downsample_epochs(X, decimation_factor=2)
-            after  = X.shape[2]
-            print(f"Downsampled: samples per trial {before} → {after}")
-
-            # NEW: drop unwanted channels
+            # keep only specified channels
             X = X[:, _KEEP_IDX, :]
-            print(f"Dropped channels {DROP_CHANNELS}, new shape {X.shape}")
-
+            # print samples before and after truncation
+            print(f"{os.path.basename(fn)}: original samples per trial = {orig_samples}, "
+                  f"after truncation = {X.shape[2]}, kept channels = {len(_KEEP_IDX)}")
             y = mat['MyLabel'].flatten()
             all_X.append(X)
             all_y.append(y)
