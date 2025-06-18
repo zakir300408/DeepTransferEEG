@@ -21,16 +21,11 @@ trial_finished()
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QFont, QPalette, QColor
 from PySide6.QtWidgets import QWidget, QLabel, QVBoxLayout
+from constants import (
+    show_rest_duration, show_fixation_duration, show_stimulus_duration, show_rest2_duration,
+    Cross_Symbol, Arrow_Left_Symbol, Arrow_Right_Symbol, Cross_Size, Arrow_Size
+)
 
-show_rest_duration = 4_000  # ms
-show_fixation_duration = 1_000  # ms
-show_stimulus_duration = 5_000  # ms
-show_rest2_duration = 4_000  # ms
-Cross_Symbol = "＋"  # Unicode for the fixation cross
-Arrow_Left_Symbol = "←"  # Unicode for left arrow
-Arrow_Right_Symbol = "→"  # Unicode for right arrow
-Cross_Size = 512  # Font size for fixation cross
-Arrow_Size = 512  # Font size for arrows
 
 class TrialWindow(QWidget):
     # hooks for external triggers
@@ -107,7 +102,7 @@ class TrialWindow(QWidget):
         self.rest1_started.emit()
 
     def _show_fixation(self):
-        self.label.setText("+")
+        self.label.setText(Cross_Symbol)
         self.label.show()
         self.fixation_started.emit()
 

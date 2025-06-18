@@ -32,6 +32,8 @@ class UserInfoApp(QMainWindow):
         self.ui.Female_radio.toggled.connect(self.update_start_button)
         self.ui.Male_radio.toggled.connect(self.update_start_button)
 
+        self.out_dir = None    # add this
+
     def browse_folder(self):
         # only show directories
         directory = QFileDialog.getExistingDirectory(
@@ -142,6 +144,9 @@ class UserInfoApp(QMainWindow):
                 f"Could not write JSON:\n{e}"
             )
             return
+
+        # remember this for later trial saving
+        self.out_dir = out_dir
 
         QMessageBox.information(
             self,
