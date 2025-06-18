@@ -557,7 +557,7 @@ def get_dataset_params(data_name, subject_names, df_meta):
     elif data_name == 'CustomEpoch':
         paradigm = 'MI'
         N = len(subject_names)
-        chn, class_num, time_sample_num, sample_rate = 27, 2, 725, 200
+        chn, class_num, time_sample_num, sample_rate = 27, 2, 725, 100
         feature_deep_dim = 704
         trial_num = int(df_meta['n_trials'].sum())
         return paradigm, N, chn, class_num, time_sample_num, sample_rate, trial_num, feature_deep_dim

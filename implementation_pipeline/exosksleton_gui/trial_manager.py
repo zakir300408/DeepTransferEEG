@@ -1,6 +1,8 @@
 import sys, os, threading
 # allow LSL import from uncle directory
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from implementation_main import EnsembleRunner
+
 import numpy as np
 from datetime import datetime
 from read_w32.read_lsl import EEGTrialStreamer

@@ -23,20 +23,21 @@ def preprocess_trial(
 ) -> np.ndarray:
     """
     Apply per-trial preprocessing:
-      1. notch @50Hz, bandpass 8–32Hz
-      2. time‐freq features (spectrogram flatten)
-      3. per‐channel z‐score
+      1. downsample 2× (200 Hz → 100 Hz)
+      2. notch @50Hz, bandpass 8–32Hz
+      3. time‐freq features (spectrogram flatten)
+      4. per‐channel z‐score
     Args:
-      trial: (n_ch, n_time)
-      sample_rate: sampling rate in Hz
+      trial: (n_ch, n_time_original)
+      sample_rate: target sampling rate in Hz (after downsampling)
     Returns:
-      proc_trial: (n_ch, n_time + n_ch*freq_bins*time_bins)
+      proc_trial: (n_ch, n_time_downsampled + tf_feats)
     """
-    # internal init
-    notch_filt, band_filt = _init_filters(sample_rate)
+    
     tf_params = _init_tf_params()
 
     # --- notch + bandpass ---
+    notch_filt, band_filt = _init_filters(sample_rate)
     bn, an = notch_filt
     b, a   = band_filt
     trial = filtfilt(bn, an, trial, axis=1)
