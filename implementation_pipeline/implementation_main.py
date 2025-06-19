@@ -1,4 +1,6 @@
 import numpy as np
+import os
+import glob
 
 from step_3_load_setup_model import setup_inference_pipeline, infer_pre_tta, infer_tta
 
@@ -83,21 +85,15 @@ if __name__ == "__main__":
         seeds=[2,3],
         sample_rate=100
     )
-
-
-#let's rather load a single trial from a path instead of using the dataset loader
-    # Example: load a single trial from a file
-    trial = np.load(r"E:\Exoskeleton_DL\DeepTransferEEG\testt\rer_1_20250619_113035\trial_1_fixation.npy")  # shape (n_ch, n_time)
-    pre_lbl, tta_lbl, avg_pre, avg_tta, p_pre, p_tta = runner.predict(trial)
-    print(f"Pred→ pre-TTA={pre_lbl}, tta-ensemble={tta_lbl}, avg_pre={avg_pre}, avg_tta={avg_tta}")
-    print(f"Individual Probabilities pre-TTA: {p_pre}, TTA: {p_tta}")
-    print("=== Prediction Results ===")
-    print(f"Pre-TTA Label: {pre_lbl}, TTA Label: {tta_lbl}")
-    print(f"Average Pre-TTA probabilities [class0, class1]: {avg_pre}")
-    print(f"Average TTA probabilities [class0, class1]: {avg_tta}")
-    print("--- Per-seed Pre-TTA probabilities [class0, class1]:")
-    for seed, prob in zip(runner.pre_state.keys(), p_pre):
-        print(f"  Seed {seed}: {prob}")
-    print("--- Per-seed TTA probabilities [class0, class1]:")
-    for seed, prob in zip(runner.tta_state.keys(), p_tta):
-        print(f"  Seed {seed}: {prob}")
+    # iterate over all fixation trials without resetting models/covariances
+    data_dir = r"E:\Exoskeleton_DL\DeepTransferEEG\testt\rer_1_20250619_113035"
+    pattern = os.path.join(data_dir, "trial_*_fixation.npy")
+    trial_files = sorted(glob.glob(pattern))
+    for trial_file in trial_files:
+        trial = np.load(trial_file)
+        pre_lbl, tta_lbl, avg_pre, avg_tta, p_pre, p_tta = runner.predict(trial)
+        print(f"\nFile: {os.path.basename(trial_file)}")
+        print(f"  Pre-TTA → label={pre_lbl}, avg_probs={avg_pre}")
+        print(f"  TTA    → label={tta_lbl}, avg_probs={avg_tta}")
+        print(f"  Per-seed Pre-TTA: {p_pre}")
+        print(f"  Per-seed TTA:     {p_tta}")

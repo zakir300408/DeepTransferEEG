@@ -1,3 +1,11 @@
+# Monkey-patch typing.Self for older Pythons so torch._dynamo can import it
+import typing
+try:
+    from typing import Self
+except ImportError:
+    from typing_extensions import Self
+typing.Self = Self
+
 import os
 import sys
 import argparse
