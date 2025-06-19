@@ -21,7 +21,7 @@ trial_finished()
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QFont, QPalette, QColor
 from PySide6.QtWidgets import QWidget, QLabel, QVBoxLayout
-from constants import (
+from .constants import (
     show_rest_duration, show_fixation_duration, show_stimulus_duration, show_rest2_duration,
     Cross_Symbol, Arrow_Left_Symbol, Arrow_Right_Symbol, Cross_Size, Arrow_Size
 )

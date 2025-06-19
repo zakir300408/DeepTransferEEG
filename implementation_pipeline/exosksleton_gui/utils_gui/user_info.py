@@ -6,7 +6,7 @@ from datetime import datetime
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QFileDialog, QMessageBox
 )
-from ui_main_window import Ui_MainWindow
+from .ui_main_window import Ui_MainWindow
 
 
 class UserInfoApp(QMainWindow):

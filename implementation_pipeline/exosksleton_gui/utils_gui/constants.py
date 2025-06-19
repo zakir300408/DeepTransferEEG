@@ -9,3 +9,5 @@ Arrow_Right_Symbol = "→"  # Unicode for right arrow
 
 Cross_Size = 512   # Font size for fixation cross
 Arrow_Size = 512   # Font size for arrows
+
+TRIAL_DURATION = 4  # seconds, total duration of each trial

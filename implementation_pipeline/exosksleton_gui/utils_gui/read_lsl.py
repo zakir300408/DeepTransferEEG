@@ -175,11 +175,12 @@ class EEGTrialStreamer:
         raw = np.array(buffer[:n_samples])        # (n_samples, all_channels)
         raw_block = raw[:, self.keep_idx]         # select desired channels
 
-        # 3) process and return
-        return process_block(
+        # process and return both processed and raw
+        processed = process_block(
             raw_block,
             self.b_notch, self.a_notch, self.sos_bp
         )
+        return processed, raw_block
 
 
 if __name__ == "__main__":

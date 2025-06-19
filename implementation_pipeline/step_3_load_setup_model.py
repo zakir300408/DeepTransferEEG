@@ -1,7 +1,7 @@
 import os
 import sys
 import argparse
-
+import typing
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -185,13 +185,13 @@ def infer_tta(model, optimizer, trial, args, R=None, data_cum=None, trial_idx=0)
     return softmax_out.cpu().numpy(), R, data_cum
 
 
-def setup_inference_pipeline(data_name, subject_id, seed=2, mode="tta"):
+def setup_inference_pipeline(seed=2, mode="tta"):
     """
     Build args and call either pre-TTA or TTA setup.
     Returns pipeline components plus args and mode
     """
     args = argparse.Namespace(
-        data_name=data_name,
+        data_name="CustomEpoch",
         SEED=seed,
         device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         backbone="EEGNet",
@@ -203,7 +203,7 @@ def setup_inference_pipeline(data_name, subject_id, seed=2, mode="tta"):
         lr=1e-4,
         max_tta=8,
         stride=1,
-        steps=3,
+        steps=1,
         t=1.7,
         conf_thresh=0.1,
         epsilon=1e-5,
@@ -224,7 +224,7 @@ if __name__ == "__main__":
     print("Model loading and setup functions ready.")
     try:
         model, R, args, mode = setup_inference_pipeline(
-            "CustomEpoch", subject_id=0, mode="pre_tta"
+            mode="pre_tta"
         )
         print(f"Successfully setup {mode} pipeline")
     except Exception as e:

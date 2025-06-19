@@ -1,17 +1,22 @@
 import sys, os, threading
+import logging
 # allow LSL import from uncle directory
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from implementation_main import EnsembleRunner
 
 import numpy as np
 from datetime import datetime
-from read_w32.read_lsl import EEGTrialStreamer
-from trial_window_ui import TrialWindow
-from constants import (
+from utils_gui.read_lsl import EEGTrialStreamer, process_block, ORIGINAL_RATE
+from utils_gui.trial_window_ui import TrialWindow
+from utils_gui.constants import (
     show_rest_duration, show_fixation_duration,
-    show_stimulus_duration, show_rest2_duration
+    show_stimulus_duration, show_rest2_duration, TRIAL_DURATION
 )
 from PySide6.QtCore import QObject, Signal
+
+# configure root logger once
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 class TrialManager(QObject):
     # emits (trial_index, full_trial_array, fixation_segment_array)
@@ -33,7 +38,8 @@ class TrialManager(QObject):
         self.trial = TrialWindow("left")
         self.trial.rest1_started.connect(self._on_rest1)
         self.trial.fixation_started.connect(self._log_fixation)
-        self.trial.trial_finished.connect(self._on_finished)
+        # wait until the save/log thread finishes before starting the next trial
+        self.trial_data_ready.connect(self._on_data_ready)
         # start first trial
         self.trial.set_trial_counter(1, num)
         self.trial.start()
@@ -42,7 +48,8 @@ class TrialManager(QObject):
         self._log_trial()
         self._read_and_save(self.counter["idx"] + 1)
 
-    def _on_finished(self):
+    def _on_data_ready(self, idx, full_arr, fix_arr):
+        # background work for trial 'idx' is done—start next or finish up
         self.counter["idx"] += 1
         if self.counter["idx"] < self.total:
             nxt = self.counter["idx"] + 1
@@ -62,14 +69,25 @@ class TrialManager(QObject):
                 show_stimulus_duration +
                 show_rest2_duration
             ) / 1000.0
-            data = self.streamer.get_trial(t=t)
-            # save full trial
+            # now returns (processed, raw_block)
+            data, raw_block = self.streamer.get_trial(t=t)
+
+            # save full trial (processed)
             full_fname = os.path.join(self.ui.out_dir, f"trial_{idx}.npy")
             np.save(full_fname, data)
             self.trials_data.append(data)
-            # extract & save 4s fixation segment
-            fix_data = segment_fixation_window(data)
+
+            # extract 4s fixation from raw_block at ORIGINAL_RATE
+            fix_raw = segment_fixation_window(raw_block.T, fs=ORIGINAL_RATE)
+            fix_data = process_block(
+                fix_raw.T,
+                self.streamer.b_notch, self.streamer.a_notch, self.streamer.sos_bp
+            )
+
+            # save processed fixation
             fix_fname = os.path.join(self.ui.out_dir, f"trial_{idx}_fixation.npy")
+            # log shape of fixation data instead of print
+            logger.info(f"Fixation data shape: {fix_data.shape}")
             np.save(fix_fname, fix_data)
             self.fixations_data.append(fix_data)
 
@@ -79,10 +97,15 @@ class TrialManager(QObject):
         threading.Thread(target=_collect, daemon=True).start()
 
     def _log_trial(self):
-        print(f"Trial started at {datetime.now().isoformat()}")
+        # include trial ID (1-based) in the log
+        idx = self.counter.get("idx", 0) + 1
+        # log timestamped message via logger
+        logger.info(f"Trial {idx} started")
 
     def _log_fixation(self):
-        print(f"Fixation started at {datetime.now().isoformat()}")
+        # include trial ID (1-based) in the log
+        idx = self.counter.get("idx", 0) + 1
+        logger.info(f"Trial {idx} – Fixation started")
 
 def segment_trial(data, start_s, end_s, fs=100.0):
     """
@@ -103,5 +126,5 @@ def segment_fixation_window(data, fs=100.0):
     Assumes show_rest_duration (ms) marks the end of rest1.
     """
     start_s = show_rest_duration / 1000.0
-    end_s   = start_s + 4.0
+    end_s   = start_s + TRIAL_DURATION
     return segment_trial(data, start_s, end_s, fs)

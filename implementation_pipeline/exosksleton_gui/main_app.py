@@ -1,6 +1,6 @@
 import sys
 from PySide6.QtWidgets import QApplication
-from user_info import UserInfoApp
+from utils_gui.user_info import UserInfoApp
 from trial_manager import TrialManager
 
 def main():
