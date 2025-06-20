@@ -16,7 +16,7 @@ def main():
     app = QApplication(sys.argv)
     ui = UserInfoApp()
     # create ensemble runner first
-    runner = EnsembleRunner(seeds=[2,3], sample_rate=100)
+    runner = EnsembleRunner(seeds=[2,3], sample_rate=100, mode="tta")
     # pass runner into manager
     manager = TrialManager(ui, runner)
     ui.ui.StartButton.clicked.connect(manager.launch)
@@ -24,5 +24,4 @@ def main():
     sys.exit(app.exec())
 
 if __name__ == "__main__":
-    main()
     main()

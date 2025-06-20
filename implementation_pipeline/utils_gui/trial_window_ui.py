@@ -3,18 +3,16 @@ trial_window.py
 ---------------
 Fullscreen stimulus window for a single trial with arrow cue.
 
-Timeline (total 14 s)
+Timeline (total 11 s)
 0–4 s   : black “rest”
 4–5 s   : white fixation “+”
-5–10 s  : arrow cue (← or →)
-10–14 s : black “rest”
+5–11 s  : arrow cue (← or →)
 
 Signals
 -------
 rest1_started()
 fixation_started()
 stimulus_started()
-rest2_started()
 trial_finished()
 """
 
@@ -22,9 +20,13 @@ from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QFont, QPalette, QColor
 from PySide6.QtWidgets import QWidget, QLabel, QVBoxLayout
 from .constants import (
-    show_rest_duration, show_fixation_duration, show_stimulus_duration, show_rest2_duration,
+    show_rest_duration, show_fixation_duration, show_stimulus_duration,
     Cross_Symbol, Arrow_Left_Symbol, Arrow_Right_Symbol, Cross_Size, Arrow_Size
 )
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 class TrialWindow(QWidget):
@@ -32,7 +34,6 @@ class TrialWindow(QWidget):
     rest1_started    = Signal()
     fixation_started = Signal()
     stimulus_started = Signal()
-    rest2_started    = Signal()
     trial_finished   = Signal()
 
     def __init__(self, direction: str, parent=None):
@@ -67,18 +68,21 @@ class TrialWindow(QWidget):
         self.counter_label.move(10, 10)
         self.counter_label.hide()
 
-        # huge font for both + and arrow
-        big_font = QFont()
-        big_font.setPointSize(Cross_Size if self.direction == "left" else Arrow_Size)
-        big_font.setBold(True)
-        self.label.setFont(big_font)
+        # font for stimuli (+ and arrow)
+        self.stimulus_font = QFont()
+        self.stimulus_font.setPointSize(Cross_Size if self.direction == "left" else Arrow_Size)
+        self.stimulus_font.setBold(True)
+
+        # font for messages like "Prediction"
+        self.message_font = QFont()
+        self.message_font.setPointSize(128)
+        self.message_font.setBold(True)
 
         # sequence: (duration_ms, handler)
         self.sequence = [
             (show_rest_duration, self._show_rest1),
             (show_fixation_duration, self._show_fixation),
-            (show_stimulus_duration, self._show_arrow),
-            (show_rest2_duration, self._show_rest2),
+            (show_stimulus_duration, self._show_arrow)
         ]
         self.current_step = -1
         self.timer = QTimer(self)
@@ -97,24 +101,32 @@ class TrialWindow(QWidget):
         self.counter_label.setText(f"{current}/{total}")
         self.counter_label.show()
 
+    def show_message(self, message: str):
+        """Display a custom message with a different font."""
+        logger.info(f"Displaying message: {message}")
+        self.label.setFont(self.message_font)
+        self.label.setText(message)
+        self.label.show()
+
     def _show_rest1(self):
+        logger.info("Rest1 started")
         self.label.hide()
         self.rest1_started.emit()
 
     def _show_fixation(self):
+        logger.info("Fixation started")
+        self.label.setFont(self.stimulus_font)
         self.label.setText(Cross_Symbol)
         self.label.show()
         self.fixation_started.emit()
 
     def _show_arrow(self):
+        logger.info("Stimulus started")
+        self.label.setFont(self.stimulus_font)
         arrow = Arrow_Left_Symbol if self.direction == "left" else Arrow_Right_Symbol
         self.label.setText(arrow)
         self.label.show()
         self.stimulus_started.emit()
-
-    def _show_rest2(self):
-        self.label.hide()
-        self.rest2_started.emit()
 
     @Slot()
     def _next_step(self):

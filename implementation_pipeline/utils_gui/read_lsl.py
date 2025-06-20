@@ -149,20 +149,18 @@ class EEGTrialStreamer:
         # design filters once
         self.b_notch, self.a_notch, self.sos_bp = design_filters()
 
-    def get_trial(self, t=TRIAL_DURATION):
+    def _collect_raw(self, t):
         """
-        Flush older samples, then batch-read exactly t*ORIGINAL_RATE samples
-        (no buffered data) using pull_chunk, and return the processed trial.
+        Flush old samples and collect exactly t seconds of raw data,
+        returning array of shape (n_samples, kept_channels).
         """
         n_samples = int(np.ceil(t * ORIGINAL_RATE))
-
-        # 1) flush buffered samples
+        # flush buffered samples
         while True:
             chunk, _ = self.inlet.pull_chunk(timeout=0.0)
             if not chunk:
                 break
-
-        # 2) collect in chunks until we have enough
+        # collect until we have enough
         buffer = []
         while len(buffer) < n_samples:
             chunk, _ = self.inlet.pull_chunk(
@@ -171,10 +169,16 @@ class EEGTrialStreamer:
             )
             if chunk:
                 buffer.extend(chunk)
+        raw = np.array(buffer[:n_samples])                # (n_samples, all_channels)
+        return raw[:, self.keep_idx]                      # select desired channels
 
-        raw = np.array(buffer[:n_samples])        # (n_samples, all_channels)
-        raw_block = raw[:, self.keep_idx]         # select desired channels
-
+    def get_trial(self, t=TRIAL_DURATION):
+        """
+        Flush older samples, then batch-read exactly t*ORIGINAL_RATE samples
+        and return the processed trial.
+        """
+        # collect raw, then process
+        raw_block = self._collect_raw(t)
         # process and return both processed and raw
         processed = process_block(
             raw_block,
@@ -189,5 +193,7 @@ if __name__ == "__main__":
     streamer = EEGTrialStreamer(debug=True)
     for idx in range(3):
         logger.info(f"Starting trial {idx+1}")
+        trial = streamer.get_trial(t=4.0)
+        logger.info(f"Trial {idx+1} shape: {trial.shape}")
         trial = streamer.get_trial(t=4.0)
         logger.info(f"Trial {idx+1} shape: {trial.shape}")
