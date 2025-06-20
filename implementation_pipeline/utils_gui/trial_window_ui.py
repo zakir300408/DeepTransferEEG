@@ -36,12 +36,12 @@ class TrialWindow(QWidget):
     stimulus_started = Signal()
     trial_finished   = Signal()
 
-    def __init__(self, direction: str, parent=None):
+    def __init__(self, direction: str = 'none', parent=None):
         """
-        direction: 'left' or 'right'
+        direction: 'left', 'right', or 'none'
         """
         super().__init__(parent)
-        self.direction = direction.lower()
+        self.set_direction(direction)
 
         # full-screen black window
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
@@ -96,6 +96,10 @@ class TrialWindow(QWidget):
         self.showFullScreen()                       # ensure it's visible
         self._next_step()
 
+    def set_direction(self, direction: str):
+        """Set the stimulus direction for the next trial."""
+        self.direction = direction.lower()
+
     def set_trial_counter(self, current: int, total: int):
         """Display 'current/total' in corner."""
         self.counter_label.setText(f"{current}/{total}")
@@ -122,10 +126,13 @@ class TrialWindow(QWidget):
 
     def _show_arrow(self):
         logger.info("Stimulus started")
-        self.label.setFont(self.stimulus_font)
-        arrow = Arrow_Left_Symbol if self.direction == "left" else Arrow_Right_Symbol
-        self.label.setText(arrow)
-        self.label.show()
+        if self.direction in ["left", "right"]:
+            self.label.setFont(self.stimulus_font)
+            arrow = Arrow_Left_Symbol if self.direction == "left" else Arrow_Right_Symbol
+            self.label.setText(arrow)
+            self.label.show()
+        else:  # 'none'
+            self.label.hide()
         self.stimulus_started.emit()
 
     @Slot()

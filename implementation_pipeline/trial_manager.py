@@ -1,16 +1,19 @@
 import sys, os, threading
 import logging
 import time
+import random
+import json
+import pyedflib
 # allow LSL import from uncle directory
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 from datetime import datetime
-from utils_gui.read_lsl import EEGTrialStreamer, process_block
+from utils_gui.read_lsl import EEGTrialStreamer, process_block, ORIGINAL_RATE
 from utils_gui.trial_window_ui import TrialWindow
 from utils_gui.constants import (
     show_rest_duration, show_fixation_duration,
-    show_stimulus_duration, TRIAL_DURATION
+    show_stimulus_duration, TRIAL_DURATION, ArmMovementDuration
 )
 from PySide6.QtCore import QObject, Signal, QTimer, Slot  # added Slot
 from control_exoskeleton import ControlExoskeleton, UP, DOWN
@@ -33,6 +36,9 @@ class TrialManager(QObject):
         self.counter = {}
         self.trials_data = []      # collect full trial arrays
         self.fixations_data = []   # collect 4s fixation segments
+        self.stimuli_sequence = []
+        self.movement_events = []
+        self.trial_results = []
 
         # Exoskeleton setup
         self.exo = None
@@ -50,37 +56,105 @@ class TrialManager(QObject):
         num = int(self.ui.ui.NumTrialsBox.text().strip() or "1")
         self.counter["idx"] = 0
         self.total = num
+
+        # Create and shuffle stimuli sequence
+        num_left = num // 3
+        num_right = num // 3
+        num_none = num - num_left - num_right
+        self.stimuli_sequence = ['left'] * num_left + ['right'] * num_right + ['none'] * num_none
+        random.seed(42)  # for reproducibility
+        random.shuffle(self.stimuli_sequence)
+        logger.info(f"Stimuli sequence for {num} trials: {self.stimuli_sequence}")
+
+        # Pre-populate trial results with stimulus and ground truth
+        self.trial_results = [
+            {
+                "trial_index": i + 1,
+                "stimulus": self.stimuli_sequence[i],
+                "ground_truth": 1 if self.stimuli_sequence[i] in ['left', 'right'] else 0,
+                "predicted_label": None,
+            }
+            for i in range(num)
+        ]
+
+        self.movement_events = [threading.Event() for _ in range(num)]
+
         # create and wire up a single TrialWindow
-        self.trial = TrialWindow("left")
+        self.trial = TrialWindow()
         self.trial.rest1_started.connect(self._on_rest1)
         self.trial.fixation_started.connect(self._log_fixation)
         self.trial.stimulus_started.connect(self._log_stimulus)     # <— new
         # when this single‐trial sequence finishes, start the next
         self.trial.trial_finished.connect(self._on_trial_finished)
-        # start first trial and immediately kick off full‐trial save
-        self.trial.set_trial_counter(1, num)
+        # start first trial
+        self._prepare_and_start_trial(self.counter['idx'])
+
+    def _prepare_and_start_trial(self, trial_idx):
+        """Sets up and starts the next trial in the sequence."""
+        stimulus = self.stimuli_sequence[trial_idx]
+        self.trial.set_direction(stimulus)
+        self.trial.set_trial_counter(trial_idx + 1, self.total)
         self.trial.start()
-        self._read_full_trial(1)
+        self._read_full_trial(trial_idx + 1)
 
     def _on_trial_finished(self):
-        """After trial ends, move to next trial or close."""
-        self.counter["idx"] += 1
-        if self.counter["idx"] < self.total:
-            nxt = self.counter["idx"] + 1
-            # wait 10 seconds (10000 ms) for action to complete, then start next trial
-            QTimer.singleShot(10000, lambda nxt=nxt: (
-                self._read_full_trial(nxt),
-                self.trial.set_trial_counter(nxt, self.total),
-                self.trial.start()
-            ))
-        else:
-            self.trial.close()
-            self.trial.deleteLater()
+        """After trial UI ends, wait for exoskeleton movement to finish, then proceed."""
+        current_idx = self.counter['idx']
+        self.wait_timer = QTimer()
+        self.wait_timer.timeout.connect(lambda: self._check_if_ready_for_next_trial(current_idx))
+        self.wait_timer.start(100)  # Check every 100ms
+
+    def _check_if_ready_for_next_trial(self, finished_trial_idx):
+        """Slot for the wait_timer. When exo is done, advance to the next trial."""
+        if self.movement_events[finished_trial_idx].is_set():
+            self.wait_timer.stop()
+            self.counter["idx"] += 1
+            if self.counter["idx"] < self.total:
+                self._prepare_and_start_trial(self.counter['idx'])
+            else:
+                self._finalize_experiment()
+                self.trial.close()
+                self.trial.deleteLater()
+
+    def _finalize_experiment(self):
+        """Calculate accuracy and save final results at the end of the experiment."""
+        predicted_labels = [r["predicted_label"] for r in self.trial_results if r["predicted_label"] is not None]
+        if not predicted_labels:
+            logger.warning("No predictions were made, cannot calculate accuracy.")
+            return
+
+        ground_truths = [r["ground_truth"] for r in self.trial_results if r["predicted_label"] is not None]
+        correct_predictions = sum(1 for gt, pred in zip(ground_truths, predicted_labels) if gt == pred)
+        accuracy = (correct_predictions / len(predicted_labels)) * 100
+        logger.info(f"Final Accuracy: {accuracy:.2f}% ({correct_predictions}/{len(predicted_labels)})")
+
+        # Add final accuracy to the results and save one last time
+        final_data = {
+            "trials": self.trial_results,
+            "final_accuracy_percent": accuracy
+        }
+        results_path = os.path.join(self.ui.out_dir, "trial_results.json")
+        try:
+            with open(results_path, "w", encoding="utf-8") as f:
+                json.dump(final_data, f, indent=4)
+            logger.info(f"Final results with accuracy saved to {results_path}")
+        except Exception as e:
+            logger.error(f"Could not write final trial results JSON: {e}")
+
+    def _save_trial_results(self):
+        """Saves the current trial results to a JSON file."""
+        results_path = os.path.join(self.ui.out_dir, "trial_results.json")
+        try:
+            with open(results_path, "w", encoding="utf-8") as f:
+                json.dump(self.trial_results, f, indent=4)
+            logger.info(f"Updated trial results saved to {results_path}")
+        except Exception as e:
+            logger.error(f"Could not write trial results JSON: {e}")
 
     def _read_full_trial(self, idx):
         """
         Collect the full trial (rest1+fix+stim) raw data
-        in a background thread and save it as trial_{idx}_raw.npy.
+        in a background thread and save it as trial_{idx}_raw.edf.
         """
         def _collect():
             # sum durations (ms) → seconds
@@ -91,8 +165,34 @@ class TrialManager(QObject):
             ) / 1000.0
             # get processed+raw, but we only save raw_block
             _, raw_block = self.streamer.get_trial(t=t_full)
-            raw_fname = os.path.join(self.ui.out_dir, f"trial_{idx}_raw.npy")
-            np.save(raw_fname, raw_block)
+
+            # Save raw data as EDF
+            edf_fname = os.path.join(self.ui.out_dir, f"trial_{idx}_raw.edf")
+            n_channels = len(self.streamer.kept_labels)
+            channel_info = [
+                {
+                    "label": label, "dimension": "uV", "sample_frequency": ORIGINAL_RATE,
+                    "physical_max": 200.0, "physical_min": -200.0,
+                    "digital_max": 32767, "digital_min": -32768,
+                    "transducer": "", "prefilter": ""
+                }
+                for label in self.streamer.kept_labels
+            ]
+
+            # Data should be (n_channels, n_samples)
+            data_for_edf = raw_block.T
+
+            f = None
+            try:
+                f = pyedflib.EdfWriter(edf_fname, n_channels, file_type=pyedflib.FILETYPE_EDFPLUS)
+                f.setSignalHeaders(channel_info)
+                f.writeSamples(data_for_edf)
+            except Exception as e:
+                logger.error(f"Could not write EDF file {edf_fname}: {e}")
+            finally:
+                if f is not None:
+                    f.close()
+
             self.trials_data.append(raw_block)
         threading.Thread(target=_collect, daemon=True).start()
 
@@ -125,6 +225,7 @@ class TrialManager(QObject):
     @Slot(int, object)
     def _schedule_prediction(self, idx, fix_data):
         """Run prediction after stimulus duration from the Qt event loop."""
+        self.movement_events[idx - 1].clear()  # Prepare for waiting on this trial's movement
         QTimer.singleShot(
             show_stimulus_duration,
             lambda: threading.Thread(
@@ -141,36 +242,46 @@ class TrialManager(QObject):
 
     # new helper to run ensemble prediction
     def _predict_on_fixation(self, idx, fix_data):
-        self.prediction_started.emit()
-        # fix_data is shape (channels, timepoints); runner.predict expects 2D (C, T)
-        trial = fix_data
-        pre_lbl, tta_lbl, avg_pre, avg_tta, p_pre, p_tta = self.runner.predict(trial)
+        try:
+            self.prediction_started.emit()
+            # fix_data is shape (channels, timepoints); runner.predict expects 2D (C, T)
+            trial = fix_data
+            pre_lbl, tta_lbl, avg_pre, avg_tta, p_pre, p_tta = self.runner.predict(trial)
 
-        log_parts = []
-        if self.runner.mode in ["pre_tta", "both"]:
-            log_parts.append(f"Pre-TTA:{pre_lbl}, avg_pre={avg_pre}")
-        if self.runner.mode in ["tta", "both"]:
-            log_parts.append(f"TTA:{tta_lbl}, avg_tta={avg_tta}")
+            log_parts = []
+            if self.runner.mode in ["pre_tta", "both"]:
+                log_parts.append(f"Pre-TTA:{pre_lbl} (from P(class1)={avg_pre[1]:.4f} > 0.5), avg_probs={avg_pre}")
+            if self.runner.mode in ["tta", "both"]:
+                log_parts.append(f"TTA:{tta_lbl} (from P(class1)={avg_tta[1]:.4f} > 0.5), avg_probs={avg_tta}")
 
-        logger.info(f"Trial {idx} prediction → " + ", ".join(log_parts))
+            logger.info(f"Trial {idx} prediction → " + ", ".join(log_parts))
 
-        # Control exoskeleton based on prediction
-        label_to_use = None
-        if self.runner.mode in ["tta", "both"]:
-            label_to_use = tta_lbl
-        elif self.runner.mode == "pre_tta":
-            label_to_use = pre_lbl
+            # Control exoskeleton based on prediction
+            label_to_use = None
+            if self.runner.mode in ["tta", "both"]:
+                label_to_use = tta_lbl
+            elif self.runner.mode == "pre_tta":
+                label_to_use = pre_lbl
 
-        if self.exo and label_to_use == 1:
-            logger.info(f"Label is 1, moving exoskeleton for trial {idx}.")
-            self.exo.send_hex(UP)
-            time.sleep(4.5)
-            self.exo.send_hex(DOWN)
-            time.sleep(4.5)
-        elif self.exo and label_to_use == 0:
-            logger.info(f"Label is 0, not moving exoskeleton for trial {idx}.")
-        elif not self.exo:
-            logger.warning("Exoskeleton not connected, skipping movement.")
+            # Update results for the current trial
+            if label_to_use is not None:
+                self.trial_results[idx - 1]["predicted_label"] = label_to_use
+
+            # Save results incrementally after each prediction
+            self._save_trial_results()
+
+            if self.exo and label_to_use == 1:
+                logger.info(f"Label is 1, moving exoskeleton for trial {idx}.")
+                self.exo.send_hex(UP)
+                time.sleep(ArmMovementDuration)  # wait for arm to move up
+                self.exo.send_hex(DOWN)
+                time.sleep(ArmMovementDuration)  # wait for arm to move down
+            elif self.exo and label_to_use == 0:
+                logger.info(f"Label is 0, not moving exoskeleton for trial {idx}.")
+            elif not self.exo:
+                logger.warning("Exoskeleton not connected, skipping movement.")
+        finally:
+            self.movement_events[idx - 1].set()  # Signal that movement task is complete
 
     def _log_trial(self):
         # include trial ID (1-based) in the log
@@ -222,4 +333,5 @@ def segment_fixation_window(data, fs=100.0):
     """
     start_s = show_rest_duration / 1000.0
     end_s   = start_s + TRIAL_DURATION
+    return segment_trial(data, start_s, end_s, fs)
     return segment_trial(data, start_s, end_s, fs)

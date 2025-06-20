@@ -10,3 +10,4 @@ Cross_Size = 512   # Font size for fixation cross
 Arrow_Size = 512   # Font size for arrows
 
 TRIAL_DURATION = 4000  # ms, total duration of each trial
+ArmMovementDuration = 8  # seconds, time for the exoskeleton to move arm down

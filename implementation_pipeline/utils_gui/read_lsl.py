@@ -133,10 +133,13 @@ class EEGTrialStreamer:
             chan_desc = chan_desc.next_sibling()
 
         # select desired channels by label
-        self.keep_idx = [
-            i for i, lbl in enumerate(all_labels)
-            if lbl.upper() in DESIRED_CHANNELS
-        ]
+        self.keep_idx = []
+        self.kept_labels = []
+        for i, lbl in enumerate(all_labels):
+            if lbl.upper() in DESIRED_CHANNELS:
+                self.keep_idx.append(i)
+                self.kept_labels.append(lbl)
+
         labels_upper = {lbl.upper() for lbl in all_labels}
         missing = DESIRED_CHANNELS - labels_upper
         if missing:
