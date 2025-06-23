@@ -92,7 +92,6 @@ class TrialManager(QObject):
     def _prepare_and_start_trial(self, trial_idx):
         """Sets up and starts the next trial in the sequence."""
         stimulus = self.stimuli_sequence[trial_idx]
-        self.trial.set_direction(stimulus)
         self.trial.set_trial_counter(trial_idx + 1, self.total)
         self.trial.start()
         self._read_full_trial(trial_idx + 1)
@@ -315,23 +314,8 @@ def segment_fixation_window(data, fs=100.0):
     """
     Return 4 seconds of data starting at fixation onset.
     Assumes show_rest_duration (ms) marks the end of rest1.
-    end_s:   float, end time in seconds
     fs:      sampling rate in Hz (default 100)
     """
     start_s = show_rest_duration / 1000.0
     end_s   = start_s + TRIAL_DURATION
-    return segment_trial(data, start_s, end_s, fs)
-    end_idx   = int(end_s   * fs)
-    return data[:, start_idx:end_idx]
-
-def segment_fixation_window(data, fs=100.0):
-    """
-    Return 4 seconds of data starting at fixation onset.
-    Assumes show_rest_duration (ms) marks the end of rest1.
-    end_s:   float, end time in seconds
-    fs:      sampling rate in Hz (default 100)
-    """
-    start_s = show_rest_duration / 1000.0
-    end_s   = start_s + TRIAL_DURATION
-    return segment_trial(data, start_s, end_s, fs)
     return segment_trial(data, start_s, end_s, fs)

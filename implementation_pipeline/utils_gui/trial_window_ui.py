@@ -21,7 +21,7 @@ from PySide6.QtGui import QFont, QPalette, QColor
 from PySide6.QtWidgets import QWidget, QLabel, QVBoxLayout
 from .constants import (
     show_rest_duration, show_fixation_duration, show_stimulus_duration,
-    Cross_Symbol, Arrow_Left_Symbol, Arrow_Right_Symbol, Cross_Size, Arrow_Size
+    Cross_Symbol, Stimulus_Symbol, Cross_Size, Stimulus_Symbol_Size
 )
 import logging
 
@@ -36,12 +36,10 @@ class TrialWindow(QWidget):
     stimulus_started = Signal()
     trial_finished   = Signal()
 
-    def __init__(self, direction: str = 'none', parent=None):
+    def __init__(self, parent=None):
         """
-        direction: 'left', 'right', or 'none'
         """
         super().__init__(parent)
-        self.set_direction(direction)
 
         # full-screen black window
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
@@ -68,9 +66,9 @@ class TrialWindow(QWidget):
         self.counter_label.move(10, 10)
         self.counter_label.hide()
 
-        # font for stimuli (+ and arrow)
+        # font for stimuli (+ and box)
         self.stimulus_font = QFont()
-        self.stimulus_font.setPointSize(Cross_Size if self.direction == "left" else Arrow_Size)
+        self.stimulus_font.setPointSize(Stimulus_Symbol_Size)
         self.stimulus_font.setBold(True)
 
         # font for messages like "Prediction"
@@ -95,10 +93,6 @@ class TrialWindow(QWidget):
         self.counter_label.raise_()
         self.showFullScreen()                       # ensure it's visible
         self._next_step()
-
-    def set_direction(self, direction: str):
-        """Set the stimulus direction for the next trial."""
-        self.direction = direction.lower()
 
     def set_trial_counter(self, current: int, total: int):
         """Display 'current/total' in corner."""
@@ -126,13 +120,9 @@ class TrialWindow(QWidget):
 
     def _show_arrow(self):
         logger.info("Stimulus started")
-        if self.direction in ["left", "right"]:
-            self.label.setFont(self.stimulus_font)
-            arrow = Arrow_Left_Symbol if self.direction == "left" else Arrow_Right_Symbol
-            self.label.setText(arrow)
-            self.label.show()
-        else:  # 'none'
-            self.label.hide()
+        self.label.setFont(self.stimulus_font)
+        self.label.setText(Stimulus_Symbol)
+        self.label.show()
         self.stimulus_started.emit()
 
     @Slot()
@@ -153,7 +143,7 @@ if __name__ == "__main__":
     import sys
 
     app = QApplication(sys.argv)
-    # example: show right-arrow cue
-    win = TrialWindow("right")
+    # example: show stimulus cue
+    win = TrialWindow()
     win.start()
     sys.exit(app.exec())
