@@ -11,12 +11,13 @@ from PySide6.QtWidgets import QApplication
 from utils_gui.user_info import UserInfoApp
 from implementation_main import EnsembleRunner
 from trial_manager import TrialManager   # reorder after importing runner
+from utils_gui.constants import SEEDS
 
 def main():
     app = QApplication(sys.argv)
     ui = UserInfoApp()
     # create ensemble runner first
-    runner = EnsembleRunner(seeds=[2,3], sample_rate=100, mode="tta")
+    runner = EnsembleRunner(seeds=SEEDS, mode="tta")
     # pass runner into manager
     manager = TrialManager(ui, runner)
     ui.ui.StartButton.clicked.connect(manager.launch)

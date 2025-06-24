@@ -567,8 +567,8 @@ def get_dataset_params(data_name, subject_names, df_meta):
 
 def build_hyperparam_grid():
     return {
-        't':       [1.5],
-        'lr':      [0.0005],
+        't':       [2],
+        'lr':      [0.001],
         'steps':   [1],
     }
 
@@ -588,14 +588,14 @@ def build_base_args(data_name, paradigm, N, chn, class_num,
     args.print_trial_details = False
     args.method           = 'T-TIME'
     args.backbone         = 'EEGNet'
-    args.batch_size       = 128
+    args.batch_size       = 30
     args.align            = True
     args.use_pretrained_model = False
     args.balanced         = True
     args.calc_time        = False
     args.max_parallel_seeds = 1
     # Fixed hyperparameters
-    args.max_tta          = 15
+    args.max_tta          = 20
     args.stride           = 1
     args.device           = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     args.data_env         = 'gpu' if torch.cuda.is_available() else 'local'

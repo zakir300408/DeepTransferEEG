@@ -2,106 +2,69 @@ import numpy as np
 import os
 import glob
 
-from step_3_load_setup_model import setup_inference_pipeline, infer_pre_tta, infer_tta
+from step_3_load_setup_model import setup_inference_pipeline
 
 class EnsembleRunner:
-    def __init__(self, seeds, sample_rate, mode="both"):
-        # Initialize all your seeds’ models, R’s, buffers, etc. once
+    def __init__(self, seeds, mode="both"):
+        """
+        seeds: list of random seeds
+        mode: one of "pre_tta", "tta", or "both"
+        """
         self.mode = mode
-        self.pre_state = {}
-        self.tta_state = {}
-        for seed in seeds:
-            if self.mode in ["pre_tta", "both"]:
-                m_pre, R_pre, args_pre, _ = setup_inference_pipeline(
-                    seed, mode="pre_tta"
-                )
-                self.pre_state[seed] = {"model": m_pre, "R": R_pre, "args": args_pre}
-
-            if self.mode in ["tta", "both"]:
-                (m_tta, opt, R_tta, buf), args_tta, _ = setup_inference_pipeline(
-                    seed, mode="tta"
-                )
-                self.tta_state[seed] = {
-                    "model": m_tta,
-                    "opt": opt,
-                    "R": R_tta,
-                    "buffer": buf,
-                    "args": args_tta,
-                }
-
-        self.sample_rate = sample_rate
         self._trial_idx = 0
 
-    def predict(self, trial):
-        """
-        Call this on each *single* trial in sequence.
-        It updates each seed’s R (and TTA buffer) in-place and returns
-        (ensemble_label_pre_tta, ensemble_label_tta).
-        """
-        # input trial is already preprocessed; skip preprocess_trial
+        # build per‐seed engines
+        self.pre_engines = {}
+        self.tta_engines = {}
+        for seed in seeds:
+            if mode in ("pre_tta", "both"):
+                self.pre_engines[seed] = setup_inference_pipeline(seed, mode="pre_tta")
+            if mode in ("tta", "both"):
+                self.tta_engines[seed] = setup_inference_pipeline(seed, mode="tta")
 
-        # Pre-TTA: collect full class probabilities
-        probs_pre, avg_pre, label_pre = None, None, None
-        if self.mode in ["pre_tta", "both"]:
+    def predict(self, trial: np.ndarray):
+        """
+        Run one trial through each seed’s engine(s), update their internal state,
+        and return all the ensemble‐aggregated labels and probabilities.
+        """
+        # Pre-TTA ensemble
+        avg_pre = label_pre = probs_pre = None
+        if self.mode in ("pre_tta", "both"):
             probs_pre = []
-            for seed, st in self.pre_state.items():
-                a = st["args"]
-                p, new_R = infer_pre_tta(
-                    model=st["model"],
-                    trial=trial[:, :a.time_sample_num],
-                    args=a,
-                    R=st["R"],
-                    trial_idx=self._trial_idx
-                )
-                st["R"] = new_R
-                probs_pre.append(p[0])  # [p_class0, p_class1]
-            avg_pre = np.mean(np.stack(probs_pre, axis=0), axis=0)
+            for eng in self.pre_engines.values():
+                p, _ = eng.infer(trial, self._trial_idx)   # returns (probs, R)
+                probs_pre.append(p.squeeze(0))
+            probs_pre = np.stack(probs_pre, axis=0)
+            avg_pre = probs_pre.mean(axis=0)
             label_pre = int(avg_pre[1] > 0.5)
 
-        # TTA: collect full class probabilities
-        probs_tta, avg_tta, label_tta = None, None, None
-        if self.mode in ["tta", "both"]:
+        # TTA ensemble
+        avg_tta = label_tta = probs_tta = None
+        if self.mode in ("tta", "both"):
             probs_tta = []
-            for seed, st in self.tta_state.items():
-                a = st["args"]
-                p, new_R, new_buf = infer_tta(
-                    model=st["model"],
-                    optimizer=st["opt"],
-                    trial=trial[:, :a.time_sample_num],
-                    args=a,
-                    R=st["R"],
-                    data_cum=st["buffer"],
-                    trial_idx=self._trial_idx
-                )
-                st["R"] = new_R
-                st["buffer"] = new_buf
-                probs_tta.append(p[0])  # [p_class0, p_class1]
-            avg_tta = np.mean(np.stack(probs_tta, axis=0), axis=0)
+            for eng in self.tta_engines.values():
+                p, _, _ = eng.infer(trial, self._trial_idx)  # returns (probs, R, buffer)
+                probs_tta.append(p.squeeze(0))
+            probs_tta = np.stack(probs_tta, axis=0)
+            avg_tta = probs_tta.mean(axis=0)
             label_tta = int(avg_tta[1] > 0.5)
 
         self._trial_idx += 1
         return label_pre, label_tta, avg_pre, avg_tta, probs_pre, probs_tta
 
-# ----------------------
-# Example live usage:
-# ----------------------
+
 if __name__ == "__main__":
-    runner = EnsembleRunner(
-        seeds=[2,3],
-        sample_rate=100,
-        mode="both"
-    )
-    # iterate over all fixation trials without resetting models/covariances
+    runner = EnsembleRunner(seeds=[2, 3], mode="both")
     data_dir = r"E:\Exoskeleton_DL\DeepTransferEEG\testt\rer_1_20250619_113035"
-    pattern = os.path.join(data_dir, "trial_*_fixation.npy")
-    trial_files = sorted(glob.glob(pattern))
-    for trial_file in trial_files:
-        trial = np.load(trial_file)
+    files = sorted(glob.glob(os.path.join(data_dir, "trial_*_fixation.npy")))
+
+    for f in files:
+        trial = np.load(f)
         pre_lbl, tta_lbl, avg_pre, avg_tta, p_pre, p_tta = runner.predict(trial)
-        print(f"\nFile: {os.path.basename(trial_file)}")
-        if runner.mode in ["pre_tta", "both"]:
+        print(f"\nFile: {os.path.basename(f)}")
+        if runner.mode in ("pre_tta", "both"):
             print(f"  Pre-TTA → label={pre_lbl}, avg_probs={avg_pre}")
-            print(f"  Per-seed Pre-TTA: {p_pre}")
-        if runner.mode in ["tta", "both"]:
-            print(f"  TTA    → label={tta_lbl}, avg_probs={avg_tta}")
-            print(f"  Per-seed TTA:     {p_tta}")
+            print(f"    per-seed: {p_pre}")
+        if runner.mode in ("tta", "both"):
+            print(f"  TTA     → label={tta_lbl}, avg_probs={avg_tta}")
+            print(f"    per-seed: {p_tta}")

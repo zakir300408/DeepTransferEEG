@@ -57,11 +57,10 @@ class TrialManager(QObject):
         self.counter["idx"] = 0
         self.total = num
 
-        # Create and shuffle stimuli sequence
-        num_left = num // 3
-        num_right = num // 3
-        num_none = num - num_left - num_right
-        self.stimuli_sequence = ['left'] * num_left + ['right'] * num_right + ['none'] * num_none
+        # Create and shuffle stimuli sequence - binary: stimulus or no stimulus
+        num_stimulus = num // 2  # Half with stimulus
+        num_none = num - num_stimulus  # Half without stimulus
+        self.stimuli_sequence = ['stimulus'] * num_stimulus + ['none'] * num_none
         random.seed(42)  # for reproducibility
         random.shuffle(self.stimuli_sequence)
         logger.info(f"Stimuli sequence for {num} trials: {self.stimuli_sequence}")
@@ -71,7 +70,7 @@ class TrialManager(QObject):
             {
                 "trial_index": i + 1,
                 "stimulus": self.stimuli_sequence[i],
-                "ground_truth": 1 if self.stimuli_sequence[i] in ['left', 'right'] else 0,
+                "ground_truth": 1 if self.stimuli_sequence[i] == 'stimulus' else 0,
                 "predicted_label": None,
             }
             for i in range(num)
@@ -156,44 +155,75 @@ class TrialManager(QObject):
         in a background thread and save it as trial_{idx}_raw.edf.
         """
         def _collect():
-            # sum durations (ms) → seconds
+            # Total trial duration in seconds
             t_full = (
                 show_rest_duration +
                 show_fixation_duration +
                 show_stimulus_duration
             ) / 1000.0
-            # get processed+raw, but we only save raw_block
+
+            # Acquire raw data block
             _, raw_block = self.streamer.get_trial(t=t_full)
 
-            # Save raw data as EDF
+            # Prepare EDF filename and data array (n_channels x n_samples)
             edf_fname = os.path.join(self.ui.out_dir, f"trial_{idx}_raw.edf")
-            n_channels = len(self.streamer.kept_labels)
-            channel_info = [
-                {
-                    "label": label, "dimension": "uV", "sample_frequency": ORIGINAL_RATE,
-                    "physical_max": 200.0, "physical_min": -200.0,
-                    "digital_max": 32767, "digital_min": -32768,
-                    "transducer": "", "prefilter": ""
-                }
-                for label in self.streamer.kept_labels
-            ]
+            data = raw_block.T
+            n_channels = data.shape[0]
 
-            # Data should be (n_channels, n_samples)
-            data_for_edf = raw_block.T
+            # Get 16-bit integer limits programmatically
+            info = np.iinfo(np.int16)
+            digital_min, digital_max = int(info.min), int(info.max)
 
+            # Build headers with dynamic rounding so each value fits ≤8 chars
+            signal_headers = []
+            for ch_idx, label in enumerate(self.streamer.kept_labels):
+                chan = data[ch_idx]
+                min_val = float(chan.min())
+                max_val = float(chan.max())
+
+                # figure out how many decimals we can keep
+                int_min = str(int(min_val))
+                dec_min = max(0, 8 - len(int_min) - 1)
+                phys_min = round(min_val, dec_min)
+
+                int_max = str(int(max_val))
+                dec_max = max(0, 8 - len(int_max) - 1)
+                phys_max = round(max_val, dec_max)
+
+                signal_headers.append({
+                    'label':            label,
+                    'dimension':        'uV',
+                    'sample_frequency': ORIGINAL_RATE,
+                    'physical_min':     phys_min,
+                    'physical_max':     phys_max,
+                    'digital_min':      digital_min,
+                    'digital_max':      digital_max,
+                    'transducer':       '',
+                    'prefilter':        ''
+                })
+
+            # Write the EDF file
             f = None
             try:
                 f = pyedflib.EdfWriter(edf_fname, n_channels, file_type=pyedflib.FILETYPE_EDFPLUS)
-                f.setSignalHeaders(channel_info)
-                f.writeSamples(data_for_edf)
+                f.setSignalHeaders(signal_headers)
+                f.writeSamples(data)
+                logger.info(f"EDF write succeeded: {edf_fname}")
             except Exception as e:
                 logger.error(f"Could not write EDF file {edf_fname}: {e}")
             finally:
                 if f is not None:
                     f.close()
 
+            # Store raw data for later use
             self.trials_data.append(raw_block)
+
+        # Run collection in background to keep UI responsive
         threading.Thread(target=_collect, daemon=True).start()
+
+
+
+
 
     def _on_rest1(self):
         self._log_trial()
@@ -239,6 +269,21 @@ class TrialManager(QObject):
         """Show prediction message in the trial window."""
         self.trial.show_message("Prediction")
 
+    def control_exoskeleton(self, idx, label):
+        """Control the exoskeleton based on the predicted label."""
+        if self.exo:
+            if label == 1:
+                logger.info(f"Label is 1, moving exoskeleton for trial {idx}.")
+                self.exo.send_hex(UP)
+                time.sleep(ArmMovementDuration)  # wait for arm to move up
+                self.exo.send_hex(DOWN)
+                time.sleep(ArmMovementDuration)  # wait for arm to move down
+            elif label == 0:
+                logger.info(f"Label is 0, not moving exoskeleton for trial {idx}.")
+        else:
+            logger.warning("Exoskeleton not connected, skipping movement.")
+
+
     # new helper to run ensemble prediction
     def _predict_on_fixation(self, idx, fix_data):
         try:
@@ -269,16 +314,8 @@ class TrialManager(QObject):
             # Save results incrementally after each prediction
             self._save_trial_results()
 
-            if self.exo and label_to_use == 1:
-                logger.info(f"Label is 1, moving exoskeleton for trial {idx}.")
-                self.exo.send_hex(UP)
-                time.sleep(ArmMovementDuration)  # wait for arm to move up
-                self.exo.send_hex(DOWN)
-                time.sleep(ArmMovementDuration)  # wait for arm to move down
-            elif self.exo and label_to_use == 0:
-                logger.info(f"Label is 0, not moving exoskeleton for trial {idx}.")
-            elif not self.exo:
-                logger.warning("Exoskeleton not connected, skipping movement.")
+            # Control the exoskeleton based on the predicted label
+            self.control_exoskeleton(idx, label_to_use)
         finally:
             self.movement_events[idx - 1].set()  # Signal that movement task is complete
 

@@ -1,26 +1,24 @@
 # Monkey-patch typing.Self for older Pythons so torch._dynamo can import it
 import typing
 try:
-    from typing import Self
+    from typing import Self as _Self
 except ImportError:
-    from typing_extensions import Self
-typing.Self = Self
+    from typing_extensions import _Self
+typing.Self = _Self
 
 import os
 import sys
 import argparse
-import typing
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.linalg as LA
 import numpy as np
 
-# add project root, tl, and runs directories to path
-def add_project_paths():
-    project_root = os.path.dirname(os.path.dirname(__file__))
-    for sub in ("", "tl", "runs"):
-        p = os.path.join(project_root, sub) if sub else project_root
+def add_project_paths(root=None, subs=("", "tl", "runs")):
+    root = root or os.path.dirname(os.path.dirname(__file__))
+    for sub in subs:
+        p = os.path.join(root, sub) if sub else root
         if p not in sys.path:
             sys.path.insert(0, p)
 
@@ -29,211 +27,171 @@ add_project_paths()
 from utils.alg_utils import EA_online
 from utils.network import backbone_net
 from utils.loss import Entropy
+from utils_gui.constants import (
+    FEATURE_DEEP_DIM, SAMPLE_RATE, CHN, TIME_SAMPLE_NUM,
+    LR, MAX_TTA, STRIDE, STEPS, T, CONF_THRESH
+)
 
 
-def load_pretrained_model(args):
-    """
-    Instantiate backbone plus classifier, load pretrained weights, return eval model
-    """
-    netF, netC = backbone_net(args, return_type="xy")
-    model = nn.Sequential(netF, netC).to(args.device)
-
-    all_subs = "_".join(map(str, range(12)))
-    ckpt_path = (
-        f"./runs/{args.data_name}/"
-        f"{args.backbone}_S{all_subs}_seed{args.SEED}_best.ckpt"
-    )
-    if not os.path.isfile(ckpt_path):
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-
-    state = torch.load(ckpt_path, map_location=args.device)
-    model.load_state_dict(state)
-    model.eval()
-    print(f"Loaded pretrained model from {ckpt_path}")
-    return model
 
 
-def setup_pre_tta_model(args):
-    """
-    Prepare model and initial EA state for pre-TTA inference
-    """
-    model = load_pretrained_model(args)
-    R = 0 if args.align else None
-    print("Pre-TTA model setup complete")
-    return model, R
+class InferenceEngine:
+    """Base class: handles model loading, tensor conversion, prediction & alignment utils."""
+    def __init__(self, args):
+        self.args = args
+        self.device = args.device
+        self._build_model()
 
+    def _build_model(self):
+        netF, netC = backbone_net(self.args, return_type="xy")
+        self.model = nn.Sequential(netF, netC).to(self.device)
+        self._load_weights()
 
-def setup_tta_model(args):
-    """
-    Prepare model, optimizer, EA state, and data buffer for full TTA
-    """
-    model, R = setup_pre_tta_model(args)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    data_cum = None
-    print("TTA model setup complete (with optimizer and buffer)")
-    return model, optimizer, R, data_cum
+    def _load_weights(self):
+        all_subs = "_".join(map(str, range(12)))
+        ckpt_dir = f"./runs/{self.args.data_name}"
+        ckpt_name = f"{self.args.backbone}_S{all_subs}_seed{self.args.SEED}_best.ckpt"
+        ckpt_path = os.path.join(ckpt_dir, ckpt_name)
+        if not os.path.isfile(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        state = torch.load(ckpt_path, map_location=self.device)
+        self.model.load_state_dict(state)
+        self.model.eval()
+        print(f"✔ Loaded pretrained model from {ckpt_path}")
 
+    def _to_tensor(self, data):
+        t = torch.from_numpy(data) if not isinstance(data, torch.Tensor) else data
+        return t.to(self.device, dtype=torch.float32)
 
-def apply_ea_alignment(sample, R, trial_idx, device):
-    """
-    Update R with the new sample and return aligned tensor plus new R
-    """
-    xn = sample.cpu().numpy()
-    R = EA_online(xn, R, trial_idx)
-    Rr = R + np.eye(R.shape[0]) * 1e-6
-    Rt = torch.from_numpy(Rr).to(device=device, dtype=sample.dtype)
-    vals, vecs = LA.eigh(Rt)
-    T = vecs @ torch.diag(vals.pow(-0.5)) @ vecs.T
-    return T @ sample, R
-
-
-def infer_pre_tta(model, trial, args, R=None, trial_idx=0):
-    """
-    Single pre-TTA inference step with optional EA update.
-    Returns (probs, R)
-    """
-    if not isinstance(trial, torch.Tensor):
-        trial = torch.from_numpy(trial)
-    trial = trial.to(args.device, dtype=torch.float32)
-
-    if args.align and R is not None:
-        trial, R = apply_ea_alignment(trial, R, trial_idx, args.device)
-
-    inp = trial.view(1, 1, args.chn, args.time_sample_num)
-    model.eval()
-    with torch.no_grad():
-        _, out = model(inp)
-        probs = torch.softmax(out, dim=1)
-
-    return probs.cpu().numpy(), R
-
-
-def should_adapt(softmax_out, trial_idx, args):
-    """
-    Decide whether to perform test-time adaptation on this trial
-    """
-    conf, _ = softmax_out.max(dim=1)
-    return (
-        conf.item() >= args.conf_thresh
-        and (trial_idx + 1) >= args.max_tta
-        and (trial_idx + 1) % args.stride == 0
-    )
-
-
-def prepare_batch(data_cum, args, R=None):
-    """
-    Slice the last window from data_cum, optionally align it, return (batch_test, R)
-    """
-    win = args.max_tta
-    raw = data_cum[-win:].squeeze(1)
-
-    if args.align and R is not None:
+    def _get_transform(self, R):
         Rr = R + np.eye(R.shape[0]) * 1e-6
-        Rt = torch.from_numpy(Rr).to(device=raw.device, dtype=raw.dtype)
+        Rt = torch.from_numpy(Rr).to(self.device, dtype=torch.float32)
         vals, vecs = LA.eigh(Rt)
-        T = vecs @ torch.diag(vals.pow(-0.5)) @ vecs.T
-        aligned = torch.einsum("ij,bjt->bit", T, raw)
-        batch_test = aligned.unsqueeze(1)
-    else:
-        batch_test = data_cum[-win:]
+        return vecs @ torch.diag(vals.pow(-0.5)) @ vecs.T
 
-    return batch_test, R
+    def _align_sample(self, sample, R, trial_idx):
+        # sample: Tensor of shape (chn, time)
+        R_new = EA_online(sample.cpu().numpy(), R, trial_idx)
+        T = self._get_transform(R_new)
+        return T @ sample, R_new
 
-
-def perform_adaptation_steps(model, optimizer, batch_test, args):
-    """
-    Run adaptation gradient steps on batch_test
-    """
-    for _ in range(args.steps):
-        optimizer.zero_grad()
-        _, out = model(batch_test)
-        p = torch.softmax(out / args.t, dim=1)
-        cem = torch.mean(Entropy(p))
-        m = p.mean(dim=0)
-        mdr = torch.sum(m * torch.log(m + args.epsilon))
-        (cem + mdr).backward()
-        optimizer.step()
-
-
-def infer_tta(model, optimizer, trial, args, R=None, data_cum=None, trial_idx=0):
-    """
-    Full TTA pipeline: initial inference, optional adaptation, final inference.
-    Returns (probs, R, data_cum)
-    """
-    if not isinstance(trial, torch.Tensor):
-        trial = torch.from_numpy(trial)
-    trial = trial.to(args.device, dtype=torch.float32)
-    sample = trial.view(1, 1, args.chn, args.time_sample_num)
-
-    data_cum = sample if data_cum is None else torch.cat((data_cum, sample), 0)
-    if data_cum.size(0) > args.max_tta:
-        data_cum = data_cum[-args.max_tta :]
-
-    if args.align and R is not None:
-        aligned, R = apply_ea_alignment(trial, R, trial_idx, args.device)
-        sample_test = aligned.view(1, 1, args.chn, args.time_sample_num)
-    else:
-        sample_test = sample
-
-    model.eval()
-    with torch.no_grad():
-        _, out1 = model(sample_test)
-        softmax_out = torch.softmax(out1, dim=1)
-
-    if should_adapt(softmax_out, trial_idx, args):
-        batch_test, R = prepare_batch(data_cum, args, R)
-        model.train()
-        perform_adaptation_steps(model, optimizer, batch_test, args)
-
-        model.eval()
+    def _predict(self, inp):
+        self.model.eval()
         with torch.no_grad():
-            _, out2 = model(sample_test)
-            softmax_out = torch.softmax(out2, dim=1)
+            _, out = self.model(inp)
+            return torch.softmax(out, dim=1)
 
-    return softmax_out.cpu().numpy(), R, data_cum
+
+class PreTTAEngine(InferenceEngine):
+    """Pre-TTA inference: just optional alignment + one softmax."""
+    def __init__(self, args):
+        super().__init__(args)
+        self.R = 0 if args.align else None
+
+    def infer(self, trial, trial_idx=0):
+        x = self._to_tensor(trial).view(1, 1, self.args.chn, self.args.time_sample_num)
+        if self.args.align and self.R is not None:
+            # strip batch/channel dims for alignment
+            sample = x.squeeze(0).squeeze(0)
+            aligned, self.R = self._align_sample(sample, self.R, trial_idx)
+            x = aligned.view(1, 1, self.args.chn, self.args.time_sample_num)
+        probs = self._predict(x)
+        return probs.cpu().numpy(), self.R
+
+
+class TTAEngine(InferenceEngine):
+    """Full TTA pipeline: rolling buffer, optional alignment, adaptation, re-infer."""
+    def __init__(self, args):
+        super().__init__(args)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=args.lr)
+        self.R = 0 if args.align else None
+        self.buffer = None
+
+    def infer(self, trial, trial_idx=0):
+        # convert + shape
+        x = self._to_tensor(trial).view(1, 1, self.args.chn, self.args.time_sample_num)
+        # rolling buffer
+        self.buffer = x if self.buffer is None else torch.cat((self.buffer, x), dim=0)
+        if self.buffer.size(0) > self.args.max_tta:
+            self.buffer = self.buffer[-self.args.max_tta:]
+
+        # alignment for this sample
+        if self.args.align and self.R is not None:
+            sample = x.squeeze(0).squeeze(0)
+            aligned, self.R = self._align_sample(sample, self.R, trial_idx)
+            x_test = aligned.view(1, 1, self.args.chn, self.args.time_sample_num)
+        else:
+            x_test = x
+
+        # first-pass inference
+        softmax_out = self._predict(x_test)
+        conf, _ = softmax_out.max(dim=1)
+
+        # decide if we should adapt
+        if (conf.item() >= self.args.conf_thresh
+            and (trial_idx + 1) >= self.args.max_tta
+            and (trial_idx + 1) % self.args.stride == 0):
+
+            batch = self.buffer[-self.args.max_tta:]
+            # optional alignment of entire batch
+            if self.args.align and self.R is not None:
+                T = self._get_transform(self.R)
+                raw = batch.squeeze(1)  # (win, chn, time)
+                aligned = torch.einsum('ij,bjt->bit', T, raw)
+                batch = aligned.unsqueeze(1)
+
+            # adaptation steps
+            self.model.train()
+            for _ in range(self.args.steps):
+                self.optimizer.zero_grad()
+                _, out = self.model(batch)
+                p = torch.softmax(out / self.args.t, dim=1)
+                loss = (
+                    torch.mean(Entropy(p)) +
+                    torch.sum(p.mean(dim=0) * torch.log(p.mean(dim=0) + self.args.epsilon))
+                )
+                loss.backward()
+                self.optimizer.step()
+            self.model.eval()
+
+            # re-infer after adaptation
+            softmax_out = self._predict(x_test)
+
+        return softmax_out.cpu().numpy(), self.R, self.buffer
 
 
 def setup_inference_pipeline(seed=2, mode="tta"):
-    """
-    Build args and call either pre-TTA or TTA setup.
-    Returns pipeline components plus args and mode
-    """
     args = argparse.Namespace(
         data_name="CustomEpoch",
         SEED=seed,
         device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         backbone="EEGNet",
-        chn=27,
-        time_sample_num=725,
+        chn=CHN,
+        time_sample_num=TIME_SAMPLE_NUM,
         class_num=2,
-        feature_deep_dim=704,
+        feature_deep_dim=FEATURE_DEEP_DIM,
         align=True,
-        lr=1e-4,
-        max_tta=8,
-        stride=1,
-        steps=1,
-        t=1.7,
-        conf_thresh=0.1,
+        lr=LR,
+        max_tta=MAX_TTA,
+        stride=STRIDE,
+        steps=STEPS,
+        t=T,
+        conf_thresh=CONF_THRESH,
         epsilon=1e-5,
-        sample_rate=100,
+        sample_rate=SAMPLE_RATE,
     )
 
     if mode == "pre_tta":
-        model, R = setup_pre_tta_model(args)
-        return model, R, args, mode
+        engine = PreTTAEngine(args)
     elif mode == "tta":
-        model, optimizer, R, data_cum = setup_tta_model(args)
-        return (model, optimizer, R, data_cum), args, mode
+        engine = TTAEngine(args)
     else:
         raise ValueError("mode must be 'pre_tta' or 'tta'")
 
+    print(f"✔ {mode.upper()} engine setup complete")
+    return engine
+
 
 if __name__ == "__main__":
-    print("Model loading and setup functions ready.")
-    try:
-        model, R, args, mode = setup_inference_pipeline(
-            mode="pre_tta"
-        )
-        print(f"Successfully setup {mode} pipeline")
-    except Exception as e:
-        print(f"Setup failed: {e}")
+    engine = setup_inference_pipeline(mode="pre_tta")
+    print("Inference engine ready.")

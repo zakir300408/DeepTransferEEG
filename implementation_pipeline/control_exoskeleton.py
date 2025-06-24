@@ -35,13 +35,13 @@ class ControlExoskeleton:
         cleaned = hex_string.replace(" ", "")
         data = bytes.fromhex(cleaned)
         self.serial.write(data)
-        print(f"Sent: {data}")
-        #read response
-        response = self.serial.read(100)  # Read up to 100 bytes
-        if response:
-            print(f"Received: {response.hex()}")
-        else:
-            print("No response received.")
+        print(f"Sent: {hex_string}")
+        # #read response
+        # response = self.serial.read(100)  # Read up to 100 bytes
+        # if response:
+        #     print(f"Received: {response.hex()}")
+        # else:
+        #     print("No response received.")
 
 if __name__ == "__main__":
     ch340_port = ControlExoskeleton.find_ch340_port()

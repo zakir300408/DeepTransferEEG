@@ -4,6 +4,7 @@ show_stimulus_duration = 6_000  # ms
 TRIAL_DURATION = 4000  # ms, total duration of each trial
 ArmMovementDuration = 8  # seconds, time for the exoskeleton to move arm down
 
+
 Cross_Symbol = "＋"       # Unicode for the fixation cross
 Stimulus_Symbol = "⊞"     # Unicode for square box stimulus in green
 
@@ -11,3 +12,18 @@ Stimulus_Symbol = "⊞"     # Unicode for square box stimulus in green
 
 Cross_Size = 512   # Font size for fixation cross and stimulus
 Stimulus_Symbol_Size = 512  # Font size for square box
+
+
+### MODEL SPECIFIC CONSTANTS ###
+SEEDS = [2, 3, 4, 5]  # Seeds for ensemble models
+SAMPLE_RATE = 100  # Sample rate for EEG data in Hz
+LR = 0.001
+CHN=27
+TIME_SAMPLE_NUM=725
+FEATURE_DEEP_DIM=704
+lr=LR
+MAX_TTA=20
+STRIDE=1
+STEPS=3
+T=2
+CONF_THRESH=0.1
