@@ -5,7 +5,7 @@ TRIAL_DURATION = 4000  # ms, total duration of each trial
 ArmMovementDuration = 8  # seconds, time for the exoskeleton to move arm down
 
 Cross_Symbol = "＋"       # Unicode for the fixation cross
-Stimulus_Symbol = "□"     # Unicode for square box stimulus
+Stimulus_Symbol = "⊞"     # Unicode for square box stimulus in green
 
 #unicode for plus sign with a hollow
 
