@@ -15,18 +15,28 @@ from pylsl import StreamInlet, resolve_streams, resolve_byprop
 from scipy.signal import butter, iirnotch, sosfiltfilt, filtfilt, spectrogram
 from joblib import Parallel, delayed
 
-# ---------- constants (no magic numbers below) ----------
-STREAM_NAME       = "iReW32_73"
-ORIGINAL_RATE     = 500.0         # Hz of incoming stream
-TARGET_RATE       = 100.0         # Hz after downsampling
-TRIAL_DURATION    = 4.0           # default seconds per trial
-FILTER_ORDER      = 4             # order for Butterworth filters
-BANDPASS_FREQS    = (8.0, 32.0)   # Hz bandpass range
-NOTCH_FREQ        = 50.0          # Hz line-noise notch
-NOTCH_Q           = 30.0          # quality factor for notch
-NPERSEG           = 128           # spectrogram segment length
-NOVERLAP          = 64            # spectrogram overlap
-DESIRED_CHANNELS  = {
+# name of the LabStreamingLayer stream
+STREAM_NAME = "iReW32_73"
+
+# sampling rates (Hz)
+ORIGINAL_RATE   = 500.0   # incoming
+TARGET_RATE     = 100.0   # after downsampling
+
+# trial timing (s)
+TRIAL_DURATION  = 4.0
+
+# Butterworth filter settings
+FILTER_ORDER    = 4
+BANDPASS_FREQS  = (8.0, 32.0)
+NOTCH_FREQ      = 50.0
+NOTCH_Q         = 30.0
+
+# spectrogram parameters
+NPERSEG         = 128
+NOVERLAP        = 64
+
+# which EEG channels to keep
+DESIRED_CHANNELS = {
     "FP1","FZ","F3","F7","FC5","FC1","C3","T7",
     "CP5","CP1","PZ","P3","P7","O1","O2","P4",
     "P8","CP6","CP2","CZ","C4","T8","FC6","FC2",

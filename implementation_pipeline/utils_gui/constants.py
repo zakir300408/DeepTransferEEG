@@ -27,3 +27,17 @@ STRIDE=1
 STEPS=3
 T=2
 CONF_THRESH=0.1
+
+
+
+
+
+#######READ LSL CONSTANTS#######
+
+"""What: This module provides constants used in the EEG trial processing pipeline.
+    These constants define the LSL stream name, sampling rates, trial timing,
+    filter settings, spectrogram parameters, and desired EEG channels.
+    """
+
+
+########################################################################

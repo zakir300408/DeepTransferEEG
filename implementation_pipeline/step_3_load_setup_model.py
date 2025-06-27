@@ -27,7 +27,7 @@ add_project_paths()
 from utils.alg_utils import EA_online
 from utils.network import backbone_net
 from utils.loss import Entropy
-from utils_gui.constants import (
+from implementation_pipeline.utils_gui.constants import (
     FEATURE_DEEP_DIM, SAMPLE_RATE, CHN, TIME_SAMPLE_NUM,
     LR, MAX_TTA, STRIDE, STEPS, T, CONF_THRESH
 )

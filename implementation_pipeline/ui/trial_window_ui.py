@@ -19,7 +19,7 @@ trial_finished()
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QFont, QPalette, QColor
 from PySide6.QtWidgets import QWidget, QLabel, QVBoxLayout
-from .constants import (
+from implementation_pipeline.utils_gui.constants import (
     show_rest_duration, show_fixation_duration, show_stimulus_duration,
     Cross_Symbol, Stimulus_Symbol, Cross_Size, Stimulus_Symbol_Size
 )
@@ -86,6 +86,7 @@ class TrialWindow(QWidget):
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
         self.timer.timeout.connect(self._next_step)
+        self.stimulus_symbol = Stimulus_Symbol
 
     def start(self):
         """Begin (or restart) the trial sequence."""
@@ -119,11 +120,17 @@ class TrialWindow(QWidget):
         self.fixation_started.emit()
 
     def _show_arrow(self):
+        """Called at t = rest+fixation to display the 'stimulus' symbol."""
         logger.info("Stimulus started")
         self.label.setFont(self.stimulus_font)
-        self.label.setText(Stimulus_Symbol)
+        # use whatever was set via set_stimulus_symbol()
+        self.label.setText(self.stimulus_symbol)
         self.label.show()
         self.stimulus_started.emit()
+        
+    def set_stimulus_symbol(self, symbol: str):
+        """Override the symbol shown during the stimulus period."""
+        self.stimulus_symbol = symbol
 
     @Slot()
     def _next_step(self):

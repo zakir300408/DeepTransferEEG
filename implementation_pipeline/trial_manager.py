@@ -10,7 +10,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from datetime import datetime
 from utils_gui.read_lsl import EEGTrialStreamer, process_block, ORIGINAL_RATE
-from utils_gui.trial_window_ui import TrialWindow
+from ui.trial_window_ui import TrialWindow
 from utils_gui.constants import (
     show_rest_duration, show_fixation_duration,
     show_stimulus_duration, TRIAL_DURATION, ArmMovementDuration
@@ -89,9 +89,17 @@ class TrialManager(QObject):
         self._prepare_and_start_trial(self.counter['idx'])
 
     def _prepare_and_start_trial(self, trial_idx):
-        """Sets up and starts the next trial in the sequence."""
-        stimulus = self.stimuli_sequence[trial_idx]
+        """Configure symbol then kick off trial #{trial_idx+1}."""
+        # update counter in UI
         self.trial.set_trial_counter(trial_idx + 1, self.total)
+
+        # pick box vs. cross based on your ground‐truth sequence
+        from utils_gui.constants import Cross_Symbol, Stimulus_Symbol
+        want = self.stimuli_sequence[trial_idx]
+        sym = Stimulus_Symbol if want == 'stimulus' else Cross_Symbol
+        self.trial.set_stimulus_symbol(sym)
+
+        # now run the trial
         self.trial.start()
         self._read_full_trial(trial_idx + 1)
 
@@ -181,14 +189,20 @@ class TrialManager(QObject):
                 min_val = float(chan.min())
                 max_val = float(chan.max())
 
-                # figure out how many decimals we can keep
-                int_min = str(int(min_val))
-                dec_min = max(0, 8 - len(int_min) - 1)
-                phys_min = round(min_val, dec_min)
+                # If min and max are equal, adjust slightly to avoid EDF error
+                if min_val == max_val:
+                    epsilon = 1e-6 if min_val == 0 else abs(min_val) * 1e-6
+                    phys_min = round(min_val - epsilon, 6)
+                    phys_max = round(max_val + epsilon, 6)
+                else:
+                    # figure out how many decimals we can keep
+                    int_min = str(int(min_val))
+                    dec_min = max(0, 8 - len(int_min) - 1)
+                    phys_min = round(min_val, dec_min)
 
-                int_max = str(int(max_val))
-                dec_max = max(0, 8 - len(int_max) - 1)
-                phys_max = round(max_val, dec_max)
+                    int_max = str(int(max_val))
+                    dec_max = max(0, 8 - len(int_max) - 1)
+                    phys_max = round(max_val, dec_max)
 
                 signal_headers.append({
                     'label':            label,

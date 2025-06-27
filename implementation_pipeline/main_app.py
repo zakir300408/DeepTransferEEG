@@ -8,9 +8,9 @@ typing.Self = Self
 
 import sys
 from PySide6.QtWidgets import QApplication
-from utils_gui.user_info import UserInfoApp
+from ui.user_info import UserInfoApp
 from implementation_main import EnsembleRunner
-from trial_manager import TrialManager   # reorder after importing runner
+from trial_manager import TrialManager   
 from utils_gui.constants import SEEDS
 
 def main():
