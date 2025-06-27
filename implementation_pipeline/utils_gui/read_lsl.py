@@ -167,7 +167,7 @@ class EEGTrialStreamer:
         Flush old samples and collect exactly t seconds of raw data,
         returning array of shape (n_samples, kept_channels).
         """
-        n_samples = int(np.ceil(t * ORIGINAL_RATE))
+        n_samples = int(round(t * ORIGINAL_RATE))  # changed from np.ceil to round
         # flush buffered samples
         while True:
             chunk, _ = self.inlet.pull_chunk(timeout=0.0)

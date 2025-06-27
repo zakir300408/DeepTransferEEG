@@ -170,8 +170,14 @@ class TrialManager(QObject):
                 show_stimulus_duration
             ) / 1000.0
 
+            logger.info(f"Collecting raw trial data for {t_full:.3f} seconds")
+
             # Acquire raw data block
             _, raw_block = self.streamer.get_trial(t=t_full)
+            logger.info(
+                f"Raw block shape: {raw_block.shape}, "
+                f"expected samples: {int(round(t_full * ORIGINAL_RATE))}"
+            )
 
             # Prepare EDF filename and data array (n_channels x n_samples)
             edf_fname = os.path.join(self.ui.out_dir, f"trial_{idx}_raw.edf")
@@ -182,28 +188,27 @@ class TrialManager(QObject):
             info = np.iinfo(np.int16)
             digital_min, digital_max = int(info.min), int(info.max)
 
-            # Build headers with dynamic rounding so each value fits ≤8 chars
+            # --- Unify resolution: use global min/max for all channels ---
+            global_min = float(np.min(data))
+            global_max = float(np.max(data))
+
+            if global_min == global_max:
+                epsilon = 1e-6 if global_min == 0 else abs(global_min) * 1e-6
+                phys_min = round(global_min - epsilon, 6)
+                phys_max = round(global_max + epsilon, 6)
+            else:
+                # figure out how many decimals we can keep
+                int_min = str(int(global_min))
+                dec_min = max(0, 8 - len(int_min) - 1)
+                phys_min = round(global_min, dec_min)
+
+                int_max = str(int(global_max))
+                dec_max = max(0, 8 - len(int_max) - 1)
+                phys_max = round(global_max, dec_max)
+
+            # Build headers: all channels use the same phys_min/phys_max
             signal_headers = []
             for ch_idx, label in enumerate(self.streamer.kept_labels):
-                chan = data[ch_idx]
-                min_val = float(chan.min())
-                max_val = float(chan.max())
-
-                # If min and max are equal, adjust slightly to avoid EDF error
-                if min_val == max_val:
-                    epsilon = 1e-6 if min_val == 0 else abs(min_val) * 1e-6
-                    phys_min = round(min_val - epsilon, 6)
-                    phys_max = round(max_val + epsilon, 6)
-                else:
-                    # figure out how many decimals we can keep
-                    int_min = str(int(min_val))
-                    dec_min = max(0, 8 - len(int_min) - 1)
-                    phys_min = round(min_val, dec_min)
-
-                    int_max = str(int(max_val))
-                    dec_max = max(0, 8 - len(int_max) - 1)
-                    phys_max = round(max_val, dec_max)
-
                 signal_headers.append({
                     'label':            label,
                     'dimension':        'uV',
@@ -219,7 +224,14 @@ class TrialManager(QObject):
             # Write the EDF file
             f = None
             try:
-                f = pyedflib.EdfWriter(edf_fname, n_channels, file_type=pyedflib.FILETYPE_EDFPLUS)
+                f = pyedflib.EdfWriter(
+                    edf_fname,
+                    n_channels,
+                    file_type=pyedflib.FILETYPE_EDFPLUS
+                )
+                # set the data-record duration to exactly t_full seconds
+                f.setDatarecordDuration(t_full)
+
                 f.setSignalHeaders(signal_headers)
                 f.writeSamples(data)
                 logger.info(f"EDF write succeeded: {edf_fname}")
@@ -234,8 +246,6 @@ class TrialManager(QObject):
 
         # Run collection in background to keep UI responsive
         threading.Thread(target=_collect, daemon=True).start()
-
-
 
 
 
@@ -284,18 +294,21 @@ class TrialManager(QObject):
         self.trial.show_message("Prediction")
 
     def control_exoskeleton(self, idx, label):
-        """Control the exoskeleton based on the predicted label."""
-        if self.exo:
-            if label == 1:
-                logger.info(f"Label is 1, moving exoskeleton for trial {idx}.")
-                self.exo.send_hex(UP)
-                time.sleep(ArmMovementDuration)  # wait for arm to move up
-                self.exo.send_hex(DOWN)
-                time.sleep(ArmMovementDuration)  # wait for arm to move down
-            elif label == 0:
-                logger.info(f"Label is 0, not moving exoskeleton for trial {idx}.")
+        """Control the exoskeleton (or fake-wait) so every trial takes the same time."""
+        logger.info(f"Trial {idx}: predicted label = {label}")
+
+        # if we have a real exo and label==1, do the two‐step movement
+        if label == 1 and self.exo:
+            logger.info(f"→ moving exoskeleton UP then DOWN for trial {idx}")
+            self.exo.send_hex(UP)
+            time.sleep(ArmMovementDuration)    # arm goes up
+            self.exo.send_hex(DOWN)
+            time.sleep(ArmMovementDuration)    # arm goes down
+
         else:
-            logger.warning("Exoskeleton not connected, skipping movement.")
+            # no physical movement, but hold for the same total duration
+            logger.info(f"→ no exoskeleton movement for trial {idx}, waiting {ArmMovementDuration*2}s")
+            time.sleep(ArmMovementDuration * 2)
 
 
     # new helper to run ensemble prediction
@@ -304,6 +317,20 @@ class TrialManager(QObject):
             self.prediction_started.emit()
             # fix_data is shape (channels, timepoints); runner.predict expects 2D (C, T)
             trial = fix_data
+
+            # Diagnostic: check for NaN/Inf in fix_data before prediction
+            nan_mask = np.isnan(trial)
+            inf_mask = np.isinf(trial)
+            if nan_mask.any() or inf_mask.any():
+                print(f"DIAGNOSTIC: NaN/Inf detected in fix_data before prediction for trial {idx}")
+                print(f"  Shape: {trial.shape}")
+                print(f"  NaN count: {np.sum(nan_mask)}")
+                print(f"  Inf count: {np.sum(inf_mask)}")
+                if trial.size < 1000:
+                    print(f"  NaN indices: {np.argwhere(nan_mask)}")
+                    print(f"  Inf indices: {np.argwhere(inf_mask)}")
+                print(f"  Min: {np.nanmin(trial)}, Max: {np.nanmax(trial)}")
+
             pre_lbl, tta_lbl, avg_pre, avg_tta, p_pre, p_tta = self.runner.predict(trial)
 
             log_parts = []

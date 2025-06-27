@@ -60,26 +60,73 @@ class InferenceEngine:
         print(f"✔ Loaded pretrained model from {ckpt_path}")
 
     def _to_tensor(self, data):
+        self._diagnose_input(data, context="to_tensor")
         t = torch.from_numpy(data) if not isinstance(data, torch.Tensor) else data
         return t.to(self.device, dtype=torch.float32)
 
     def _get_transform(self, R):
+        # Diagnostic: check R before eig
+        if np.isnan(R).any() or np.isinf(R).any():
+            print("DIAGNOSTIC: NaN/Inf in covariance matrix R before eig")
         Rr = R + np.eye(R.shape[0]) * 1e-6
         Rt = torch.from_numpy(Rr).to(self.device, dtype=torch.float32)
         vals, vecs = LA.eigh(Rt)
+        # Diagnostic: check eigenvalues
+        if torch.isnan(vals).any() or torch.isinf(vals).any():
+            print("DIAGNOSTIC: NaN/Inf in eigenvalues of R")
+        if (vals <= 0).any():
+            print("DIAGNOSTIC: Non-positive eigenvalues in R, min eigenvalue:", vals.min().item())
         return vecs @ torch.diag(vals.pow(-0.5)) @ vecs.T
 
     def _align_sample(self, sample, R, trial_idx):
-        # sample: Tensor of shape (chn, time)
-        R_new = EA_online(sample.cpu().numpy(), R, trial_idx)
+        # Diagnostic: check sample before alignment
+        arr = sample.cpu().numpy() if hasattr(sample, "cpu") else sample
+        if np.isnan(arr).any() or np.isinf(arr).any():
+            print("DIAGNOSTIC: NaN/Inf in sample before alignment")
+        if np.all(arr == 0):
+            print("DIAGNOSTIC: Sample before alignment is all zeros")
+        R_new = EA_online(arr, R, trial_idx)
+        # Diagnostic: check R_new after EA_online
+        if np.isnan(R_new).any() or np.isinf(R_new).any():
+            print("DIAGNOSTIC: NaN/Inf in R_new after EA_online")
         T = self._get_transform(R_new)
-        return T @ sample, R_new
+        aligned = T @ sample
+        # Diagnostic: check aligned output
+        if torch.isnan(aligned).any() or torch.isinf(aligned).any():
+            print("DIAGNOSTIC: NaN/Inf in aligned sample output")
+        return aligned, R_new
 
     def _predict(self, inp):
+        # Check for NaN/Inf in input
+        if torch.isnan(inp).any() or torch.isinf(inp).any():
+            print("WARNING: Input to model contains NaN or Inf")
         self.model.eval()
         with torch.no_grad():
             _, out = self.model(inp)
-            return torch.softmax(out, dim=1)
+            # Check for NaN/Inf in output
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                print("WARNING: Model output contains NaN or Inf")
+            probs = torch.softmax(out, dim=1)
+            # Check for NaN/Inf in probabilities
+            if torch.isnan(probs).any() or torch.isinf(probs).any():
+                print("WARNING: Softmax output contains NaN or Inf")
+            return probs
+
+    def _diagnose_input(self, data, context=""):
+        """Prints stats and locations of NaN/Inf in input data for debugging."""
+        arr = data if isinstance(data, np.ndarray) else data.cpu().numpy()
+        nan_mask = np.isnan(arr)
+        inf_mask = np.isinf(arr)
+        if nan_mask.any() or inf_mask.any():
+            print(f"DIAGNOSTIC: Detected NaN/Inf in input {context}")
+            print(f"  Shape: {arr.shape}")
+            print(f"  NaN count: {np.sum(nan_mask)}")
+            print(f"  Inf count: {np.sum(inf_mask)}")
+            # Optionally print indices (for small arrays)
+            if arr.size < 1000:
+                print(f"  NaN indices: {np.argwhere(nan_mask)}")
+                print(f"  Inf indices: {np.argwhere(inf_mask)}")
+            print(f"  Min: {np.nanmin(arr)}, Max: {np.nanmax(arr)}")
 
 
 class PreTTAEngine(InferenceEngine):
@@ -90,11 +137,14 @@ class PreTTAEngine(InferenceEngine):
 
     def infer(self, trial, trial_idx=0):
         x = self._to_tensor(trial).view(1, 1, self.args.chn, self.args.time_sample_num)
+        # Diagnostic: check after tensor conversion
+        self._diagnose_input(x.cpu().numpy(), context="after _to_tensor in PreTTAEngine")
         if self.args.align and self.R is not None:
-            # strip batch/channel dims for alignment
             sample = x.squeeze(0).squeeze(0)
             aligned, self.R = self._align_sample(sample, self.R, trial_idx)
             x = aligned.view(1, 1, self.args.chn, self.args.time_sample_num)
+            # Diagnostic: check after alignment
+            self._diagnose_input(x.cpu().numpy(), context="after alignment in PreTTAEngine")
         probs = self._predict(x)
         return probs.cpu().numpy(), self.R
 
@@ -108,18 +158,19 @@ class TTAEngine(InferenceEngine):
         self.buffer = None
 
     def infer(self, trial, trial_idx=0):
-        # convert + shape
         x = self._to_tensor(trial).view(1, 1, self.args.chn, self.args.time_sample_num)
-        # rolling buffer
+        # Diagnostic: check after tensor conversion
+        self._diagnose_input(x.cpu().numpy(), context="after _to_tensor in TTAEngine")
         self.buffer = x if self.buffer is None else torch.cat((self.buffer, x), dim=0)
         if self.buffer.size(0) > self.args.max_tta:
             self.buffer = self.buffer[-self.args.max_tta:]
 
-        # alignment for this sample
         if self.args.align and self.R is not None:
             sample = x.squeeze(0).squeeze(0)
             aligned, self.R = self._align_sample(sample, self.R, trial_idx)
             x_test = aligned.view(1, 1, self.args.chn, self.args.time_sample_num)
+            # Diagnostic: check after alignment
+            self._diagnose_input(x_test.cpu().numpy(), context="after alignment in TTAEngine")
         else:
             x_test = x
 

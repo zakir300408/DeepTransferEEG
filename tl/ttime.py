@@ -588,14 +588,14 @@ def build_base_args(data_name, paradigm, N, chn, class_num,
     args.print_trial_details = False
     args.method           = 'T-TIME'
     args.backbone         = 'EEGNet'
-    args.batch_size       = 30
+    args.batch_size       = 64
     args.align            = True
     args.use_pretrained_model = False
     args.balanced         = True
     args.calc_time        = False
     args.max_parallel_seeds = 1
     # Fixed hyperparameters
-    args.max_tta          = 20
+    args.max_tta          = 15
     args.stride           = 1
     args.device           = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     args.data_env         = 'gpu' if torch.cuda.is_available() else 'local'
@@ -886,7 +886,7 @@ def main():
         base_args = build_base_args(
             data_name, paradigm, N, chn, class_num, tsn, sr, tn, fdd
         )
-        seeds = [2,3,4,5]
+        seeds = [2, 3, 4, 5, 6, 7]
 
         for hp_values in product(*grid.values()):
             hp = dict(zip(grid.keys(), hp_values))
