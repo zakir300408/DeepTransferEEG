@@ -3,10 +3,10 @@
 What: This module provides EEGTrialStreamer, which connects once to an LSL EEG stream,
      selects only the specified channels, then on demand segments a fixed-length trial
      starting from the moment you call get_trial() (no old data), applies a 50 Hz
-     notch and 8-32 Hz bandpass (zero-phase), downsamples from 500 Hz to 100 Hz,
-     computes time-frequency spectrogram features, concatenates them with the
-     time-series, and returns each trial as an array of shape
-     (channels, timepoints + tf_feature_bins).
+     notch and 8–32 Hz bandpass (zero-phase), downsamples from 500 Hz to 100 Hz,
+     applies a multi‐band spectral‐fusion filterbank (θ, α, β, full), computes time‐frequency
+     spectrogram features on the fused signal, concatenates them with the fused time‐series,
+     and returns each trial as an array of shape (channels, timepoints + tf_feature_bins).
 """
 
 import logging
@@ -16,24 +16,32 @@ from scipy.signal import butter, iirnotch, sosfiltfilt, filtfilt, spectrogram
 from joblib import Parallel, delayed
 
 # name of the LabStreamingLayer stream
-STREAM_NAME = "iReW32_73"
+STREAM_NAME    = "iReW32_73"
 
 # sampling rates (Hz)
-ORIGINAL_RATE   = 500.0   # incoming
-TARGET_RATE     = 100.0   # after downsampling
+ORIGINAL_RATE  = 500.0   # incoming
+TARGET_RATE    = 100.0   # after downsampling
 
 # trial timing (s)
-TRIAL_DURATION  = 4.0
+TRIAL_DURATION = 4.0
 
 # Butterworth filter settings
-FILTER_ORDER    = 4
-BANDPASS_FREQS  = (8.0, 32.0)
-NOTCH_FREQ      = 50.0
-NOTCH_Q         = 30.0
+FILTER_ORDER   = 4
+BANDPASS_FREQS = (8.0, 32.0)
+NOTCH_FREQ     = 50.0
+NOTCH_Q        = 30.0
+
+# filterbank bands (Hz)
+FILTERBANK_BANDS = [
+    (4.0, 7.0),    # theta
+    (7.0, 13.0),   # alpha
+    (13.0, 32.0),  # beta
+    (1.0, 40.0)    # full
+]
 
 # spectrogram parameters
-NPERSEG         = 128
-NOVERLAP        = 64
+NPERSEG   = 128
+NOVERLAP  = 64
 
 # which EEG channels to keep
 DESIRED_CHANNELS = {
@@ -65,54 +73,65 @@ def design_filters():
 
 def process_block(raw_block, b_notch, a_notch, sos_bp):
     """
-    1) zero-phase notch + bandpass on raw (500 Hz)
-    2) downsample to TARGET_RATE
-    3) compute TF spectrogram per channel
-    4) flatten and concatenate TF features with time-series
-    Returns: array of shape (channels, timepoints + freq_bins * time_bins)
+    1) zero-phase notch + 8–32 Hz bandpass on raw (500 Hz)
+    2) downsample to TARGET_RATE (100 Hz)
+    3) apply multi-band spectral-fusion filterbank (θ, α, β, full)
+    4) compute TF spectrogram per channel on the fused signal
+    5) flatten and concatenate TF features with the fused time-series
+
+    Returns: array of shape (channels, timepoints + freq_bins*time_bins)
     """
-    # 1) filter
+    # --- Step 1: notch & bandpass at original rate ---
     data_notch = filtfilt(b_notch, a_notch, raw_block, axis=0)
     data_bp    = sosfiltfilt(sos_bp, data_notch, axis=0)
 
-    # 2) downsample by integer decimation
-    decim = int(round(ORIGINAL_RATE / TARGET_RATE))
-    data_ds = data_bp[::decim, :]  # (n_timepoints, n_channels)
+    # --- Step 2: downsample by integer decimation ---
+    decim   = int(round(ORIGINAL_RATE / TARGET_RATE))
+    data_ds = data_bp[::decim, :]  # shape (n_samples_ds, n_channels)
 
-    # prepare for spectrogram
-    X = data_ds.T[np.newaxis, :, :]  # shape (1, C, T)
-    sample_rate = TARGET_RATE
+    # --- Step 3: filterbank spectral fusion ---
+    # X_fused: same shape as data_ds
+    X_fused = np.zeros_like(data_ds)
+    nyq_fb  = TARGET_RATE / 2.0
+    for low, high in FILTERBANK_BANDS:
+        b, a = butter(FILTER_ORDER, [low/nyq_fb, high/nyq_fb], btype='band')
+        Xf    = filtfilt(b, a, data_ds, axis=0)
+        X_fused += Xf
+    X_fused /= len(FILTERBANK_BANDS)  # average
 
-    # get freq/time-bin counts from one channel
+    # --- Step 4: compute spectrogram features per channel ---
+    # get freq/time dims from first channel
     _, _, S0 = spectrogram(
-        X[0, 0], fs=sample_rate,
-        nperseg=NPERSEG, noverlap=NOVERLAP
+        X_fused[:, 0],
+        fs=TARGET_RATE,
+        nperseg=NPERSEG,
+        noverlap=NOVERLAP
     )
     freq_bins, time_bins = S0.shape
 
-    # flatten channels for parallel TF
-    flat_X = X.reshape(-1, X.shape[2])  # shape (C, T)
-
+    # prepare channel-wise data
     def _compute_sxx(x):
         return spectrogram(
-            x, fs=sample_rate,
-            nperseg=NPERSEG, noverlap=NOVERLAP
+            x,
+            fs=TARGET_RATE,
+            nperseg=NPERSEG,
+            noverlap=NOVERLAP
         )[2]
 
+    # run in parallel across channels
+    X_ch = [X_fused[:, ch] for ch in range(X_fused.shape[1])]
     sxx_list = Parallel(n_jobs=-1)(
-        delayed(_compute_sxx)(flat_X[k])
-        for k in range(flat_X.shape[0])
+        delayed(_compute_sxx)(X_ch[ch])
+        for ch in range(len(X_ch))
     )
+    tf_feats = np.stack(sxx_list)  # shape (n_channels, freq_bins, time_bins)
+    tf_flat  = tf_feats.reshape(X_fused.shape[1], -1)  # (n_channels, freq_bins*time_bins)
 
-    tf_feats = (
-        np.stack(sxx_list)
-         .reshape(X.shape[0], X.shape[1], freq_bins, time_bins)
-    )
-    tf_flat = tf_feats.reshape(X.shape[0], X.shape[1], -1)
+    # --- Step 5: concatenate fused time-series + TF features ---
+    X_time = X_fused.T  # (n_channels, n_samples_ds)
+    X_aug  = np.concatenate([X_time, tf_flat], axis=1)  # (n_channels, n_samples_ds + freq_bins*time_bins)
 
-    # 4) concatenate along time axis
-    X_aug = np.concatenate([X, tf_flat], axis=2)  # (1, C, T + F*T')
-    return X_aug[0]  # (C, T + F*T')
+    return X_aug
 
 
 class EEGTrialStreamer:
@@ -143,7 +162,7 @@ class EEGTrialStreamer:
             chan_desc = chan_desc.next_sibling()
 
         # select desired channels by label
-        self.keep_idx = []
+        self.keep_idx    = []
         self.kept_labels = []
         for i, lbl in enumerate(all_labels):
             if lbl.upper() in DESIRED_CHANNELS:
@@ -167,7 +186,7 @@ class EEGTrialStreamer:
         Flush old samples and collect exactly t seconds of raw data,
         returning array of shape (n_samples, kept_channels).
         """
-        n_samples = int(round(t * ORIGINAL_RATE))  # changed from np.ceil to round
+        n_samples = int(round(t * ORIGINAL_RATE))
         # flush buffered samples
         while True:
             chunk, _ = self.inlet.pull_chunk(timeout=0.0)
@@ -182,17 +201,15 @@ class EEGTrialStreamer:
             )
             if chunk:
                 buffer.extend(chunk)
-        raw = np.array(buffer[:n_samples])                # (n_samples, all_channels)
-        return raw[:, self.keep_idx]                      # select desired channels
+        raw = np.array(buffer[:n_samples])      # (n_samples, all_channels)
+        return raw[:, self.keep_idx]            # select desired channels
 
     def get_trial(self, t=TRIAL_DURATION):
         """
         Flush older samples, then batch-read exactly t*ORIGINAL_RATE samples
-        and return the processed trial.
+        and return the processed trial plus the raw block.
         """
-        # collect raw, then process
         raw_block = self._collect_raw(t)
-        # process and return both processed and raw
         processed = process_block(
             raw_block,
             self.b_notch, self.a_notch, self.sos_bp
@@ -206,7 +223,5 @@ if __name__ == "__main__":
     streamer = EEGTrialStreamer(debug=True)
     for idx in range(3):
         logger.info(f"Starting trial {idx+1}")
-        trial = streamer.get_trial(t=4.0)
-        logger.info(f"Trial {idx+1} shape: {trial.shape}")
-        trial = streamer.get_trial(t=4.0)
-        logger.info(f"Trial {idx+1} shape: {trial.shape}")
+        proc, raw = streamer.get_trial(t=4.0)
+        logger.info(f"Trial {idx+1} processed shape: {proc.shape}, raw shape: {raw.shape}")

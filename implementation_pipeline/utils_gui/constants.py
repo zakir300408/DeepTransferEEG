@@ -3,6 +3,7 @@ show_fixation_duration = 1_500  # ms
 show_stimulus_duration = 6_000  # ms
 TRIAL_DURATION = 4000  # ms, total duration of each trial
 ArmMovementDuration = 8  # seconds, time for the exoskeleton to move arm down
+DELAY_POST_STIMULUS = 500  # ms, delay after stimulus before segmentation
 
 
 Cross_Symbol = "＋"       # Unicode for the fixation cross
@@ -15,14 +16,13 @@ Stimulus_Symbol_Size = 512  # Font size for square box
 
 
 ### MODEL SPECIFIC CONSTANTS ###
-SEEDS = [2, 3, 4, 5]  # Seeds for ensemble models
+SEEDS = [2, 3, 4, 5, 6, 7]  # Seeds for ensemble models
 SAMPLE_RATE = 100  # Sample rate for EEG data in Hz
 LR = 0.001
 CHN = 27
 TIME_SAMPLE_NUM = 725
 FEATURE_DEEP_DIM = 704
-lr=LR
-MAX_TTA=10
+MAX_TTA=30
 STRIDE=1
 STEPS=1
 T=2
