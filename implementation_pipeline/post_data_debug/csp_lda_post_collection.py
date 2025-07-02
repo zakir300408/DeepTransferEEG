@@ -7,7 +7,7 @@ Loads EDF trials and labels, preprocesses the data, trains CSP+LDA, and evaluate
 # ----------------------------
 # Configuration & Constants
 # ----------------------------
-DATA_FOLDER           = r"E:\Exoskeleton_DL\DeepTransferEEG\iplementaion_runn\12_12_20250627_155138"
+DATA_FOLDER           = r"E:\Exoskeleton_DL\DeepTransferEEG\iplementaion_runn\Zhao Xu_1_20250701_171837"
 LABEL_FILE            = "trial_results.json"
 TRIAL_PATTERN         = "trial_{idx}_raw.edf"
 TRUNCATE_START_SEC    = 5.5
@@ -17,7 +17,7 @@ BANDPASS_HIGH_HZ      = 32.0
 NOTCH_FREQ_HZ         = 50.0
 ORIGINAL_SFREQ_HZ     = 500
 TARGET_SFREQ_HZ       = 100
-NUM_TRAIN_TRIALS      = 3
+NUM_TRAIN_TRIALS      = 20
 CSP_NUM_COMPONENTS    = 4
 LOG_FILE              = "processing.log"
 
