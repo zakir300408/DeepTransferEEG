@@ -569,7 +569,7 @@ def build_hyperparam_grid():
     return {
         't':       [2],
         'lr':      [0.001],
-        'steps':   [2],
+        'steps':   [1],
     }
 
 

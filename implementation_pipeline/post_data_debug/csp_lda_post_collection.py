@@ -7,13 +7,13 @@ Loads EDF trials and labels, preprocesses the data, trains CSP+LDA, and evaluate
 # ----------------------------
 # Configuration & Constants
 # ----------------------------
-DATA_FOLDER           = r"E:\Exoskeleton_DL\DeepTransferEEG\iplementaion_runn\Zhao Xu_1_20250701_171837"
+DATA_FOLDER           = r"E:\Exoskeleton_DL\DeepTransferEEG\iplementaion_runn\penteng_2_20250702_151500"
 LABEL_FILE            = "trial_results.json"
 TRIAL_PATTERN         = "trial_{idx}_raw.edf"
 TRUNCATE_START_SEC    = 5.5
 TRUNCATE_END_SEC      = 2
-BANDPASS_LOW_HZ       = 8.0
-BANDPASS_HIGH_HZ      = 32.0
+BANDPASS_LOW_HZ       = 8
+BANDPASS_HIGH_HZ      = 32
 NOTCH_FREQ_HZ         = 50.0
 ORIGINAL_SFREQ_HZ     = 500
 TARGET_SFREQ_HZ       = 100
@@ -53,7 +53,14 @@ for h in handlers:
 # ----------------------------
 def load_labels(label_path: str) -> dict[int, int]:
     with open(label_path, "r") as f:
-        trials = json.load(f).get("trials", [])
+        data = json.load(f)
+    # support dict-with-"trials" or plain list
+    if isinstance(data, dict) and "trials" in data and isinstance(data["trials"], list):
+        trials = data["trials"]
+    elif isinstance(data, list):
+        trials = data
+    else:
+        raise ValueError(f"{label_path} must be a dict with 'trials' list or a list of trials")
     return {t["trial_index"]: t["ground_truth"] for t in trials}
 
 
@@ -119,17 +126,21 @@ def preprocess_trial(raw: mne.io.Raw) -> np.ndarray:
     post_crop_shape = raw_copy.get_data().shape
     logger.info(f"After truncation: shape {post_crop_shape}")
 
-    # Bandpass
+    # FFT-based notch first, only on EEG channels
+    logger.info(f"Applying notch filter at {NOTCH_FREQ_HZ} Hz on EEG channels")
+    raw_copy.notch_filter(
+        freqs=NOTCH_FREQ_HZ,
+        method='spectrum_fit',
+        picks='eeg'
+    )
+
+    # Bandpass only on EEG channels
+    logger.info(f"Applying bandpass filter {BANDPASS_LOW_HZ}-{BANDPASS_HIGH_HZ} Hz on EEG channels")
     raw_copy.filter(
         l_freq=BANDPASS_LOW_HZ,
         h_freq=BANDPASS_HIGH_HZ,
-        fir_design='firwin'
-    )
-
-    # FFT‐based notch (no long FIR filter)
-    raw_copy.notch_filter(
-        freqs=NOTCH_FREQ_HZ,
-        method='spectrum_fit'
+        fir_design='firwin',
+        picks='eeg'
     )
 
     # Resample

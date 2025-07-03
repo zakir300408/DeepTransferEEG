@@ -281,8 +281,10 @@ class TrialManager(QObject):
             self.exo.send_hex(UP); time.sleep(ArmMovementDuration)
             self.exo.send_hex(DOWN); time.sleep(ArmMovementDuration)
         else:
-            logger.info(f"[Trial {idx}] No movement, waiting {ArmMovementDuration*2}s")
-            time.sleep(ArmMovementDuration * 2)
+            # reduce fake delay to 2 seconds when no exo or label=0
+            delay = 1
+            logger.info(f"[Trial {idx}] No movement, waiting {delay}s")
+            time.sleep(delay)
 
     def _predict_on_fixation(self, idx, fix_data):
         start = datetime.now().time()

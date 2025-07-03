@@ -16,17 +16,17 @@ Stimulus_Symbol_Size = 512  # Font size for square box
 
 
 ### MODEL SPECIFIC CONSTANTS ###
-SEEDS = [2, 3, 4, 5, 6, 7]  # Seeds for ensemble models
+SEEDS = [2, 3,4, 5, 6, 7]  # Seeds for ensemble models
 SAMPLE_RATE = 100  # Sample rate for EEG data in Hz
-LR = 0.001
+LR = 0.0001
 CHN = 27
 TIME_SAMPLE_NUM = 725
 FEATURE_DEEP_DIM = 704
-MAX_TTA=25
+MAX_TTA=4   # was 10, reduced to trigger adaptation every trial for debug
 STRIDE=1
 STEPS=1
 T=2
-CONF_THRESH=0.2
+CONF_THRESH=0.5
 
 
 

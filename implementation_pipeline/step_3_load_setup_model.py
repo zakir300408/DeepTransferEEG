@@ -1,10 +1,10 @@
 # Monkey-patch typing.Self for older Pythons so torch._dynamo can import it
 import typing
 try:
-    from typing import Self as _Self
+    from typing import Self
 except ImportError:
-    from typing_extensions import _Self
-typing.Self = _Self
+    from typing_extensions import Self
+typing.Self = Self
 
 import os
 import sys
@@ -14,6 +14,8 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.linalg as LA
 import numpy as np
+import glob
+import copy  # new import
 
 def add_project_paths(root=None, subs=("", "tl", "runs")):
     root = root or os.path.dirname(os.path.dirname(__file__))
@@ -40,24 +42,38 @@ class InferenceEngine:
     def __init__(self, args):
         self.args = args
         self.device = args.device
+        self.models: list[nn.Sequential] = []
         self._build_model()
-
-    def _build_model(self):
-        netF, netC = backbone_net(self.args, return_type="xy")
-        self.model = nn.Sequential(netF, netC).to(self.device)
         self._load_weights()
 
+    def _build_model(self):
+        # build prototype only (no weights yet)
+        netF, netC = backbone_net(self.args, return_type="xy")
+        self._netF = netF
+        self._netC = netC
+
     def _load_weights(self):
-        all_subs = "_".join(map(str, range(12)))
         ckpt_dir = f"./runs/{self.args.data_name}"
-        ckpt_name = f"{self.args.backbone}_S{all_subs}_seed{self.args.SEED}_best.ckpt"
-        ckpt_path = os.path.join(ckpt_dir, ckpt_name)
-        if not os.path.isfile(ckpt_path):
-            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-        state = torch.load(ckpt_path, map_location=self.device)
-        self.model.load_state_dict(state)
-        self.model.eval()
-        print(f"✔ Loaded pretrained model from {ckpt_path}")
+        pattern = f"{self.args.backbone}_S*_seed{self.args.SEED}_best.ckpt"
+        paths = sorted(glob.glob(os.path.join(ckpt_dir, pattern)))
+        if not paths:
+            raise FileNotFoundError(f"No checkpoints found matching {pattern} in {ckpt_dir}")
+
+        # use the one built prototype to instantiate all ensemble members
+        protoF, protoC = self._netF, self._netC
+        for ckpt in paths:
+            netF = copy.deepcopy(protoF)
+            netC = copy.deepcopy(protoC)
+            model = nn.Sequential(netF, netC).to(self.device)
+
+            state = torch.load(ckpt, map_location=self.device)
+            model.load_state_dict(state)
+            model.eval()
+            self.models.append(model)
+            print(f"✔ Loaded model from {ckpt}")
+
+        # pick primary model for adaptation/optimizer
+        self.model = self.models[0]
 
     def _to_tensor(self, data):
         self._diagnose_input(data, context="to_tensor")
@@ -100,17 +116,14 @@ class InferenceEngine:
         # Check for NaN/Inf in input
         if torch.isnan(inp).any() or torch.isinf(inp).any():
             print("WARNING: Input to model contains NaN or Inf")
-        self.model.eval()
-        with torch.no_grad():
-            _, out = self.model(inp)
-            # Check for NaN/Inf in output
-            if torch.isnan(out).any() or torch.isinf(out).any():
-                print("WARNING: Model output contains NaN or Inf")
-            probs = torch.softmax(out, dim=1)
-            # Check for NaN/Inf in probabilities
-            if torch.isnan(probs).any() or torch.isinf(probs).any():
-                print("WARNING: Softmax output contains NaN or Inf")
-            return probs
+        # ensemble inference
+        probs_list = []
+        for m in self.models:
+            with torch.no_grad():
+                _, out = m(inp)
+                probs_list.append(torch.softmax(out, dim=1))
+        stacked = torch.stack(probs_list, dim=0)  # (n_models, batch, classes)
+        return stacked.mean(dim=0)
 
     def _diagnose_input(self, data, context=""):
         """Prints stats and locations of NaN/Inf in input data for debugging."""
@@ -133,7 +146,7 @@ class PreTTAEngine(InferenceEngine):
     """Pre-TTA inference: just optional alignment + one softmax."""
     def __init__(self, args):
         super().__init__(args)
-        self.R = 0 if args.align else None
+        self.R = np.zeros((args.chn, args.chn)) if args.align else None
 
     def infer(self, trial, trial_idx=0):
         x = self._to_tensor(trial).view(1, 1, self.args.chn, self.args.time_sample_num)
@@ -153,8 +166,9 @@ class TTAEngine(InferenceEngine):
     """Full TTA pipeline: rolling buffer, optional alignment, adaptation, re-infer."""
     def __init__(self, args):
         super().__init__(args)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=args.lr)
-        self.R = 0 if args.align else None
+        # one optimizer for each ensemble member
+        self.optimizers = [optim.Adam(m.parameters(), lr=args.lr) for m in self.models]
+        self.R = np.zeros((args.chn, args.chn)) if args.align else None
         self.buffer = None
 
     def infer(self, trial, trial_idx=0):
@@ -182,28 +196,39 @@ class TTAEngine(InferenceEngine):
         if (conf.item() >= self.args.conf_thresh
             and (trial_idx + 1) >= self.args.max_tta
             and (trial_idx + 1) % self.args.stride == 0):
+            print(f">>> Adapting at trial {trial_idx+1} (conf={conf.item():.3f})")
 
             batch = self.buffer[-self.args.max_tta:]
-            # optional alignment of entire batch
             if self.args.align and self.R is not None:
                 T = self._get_transform(self.R)
                 raw = batch.squeeze(1)  # (win, chn, time)
                 aligned = torch.einsum('ij,bjt->bit', T, raw)
                 batch = aligned.unsqueeze(1)
 
-            # adaptation steps
-            self.model.train()
-            for _ in range(self.args.steps):
-                self.optimizer.zero_grad()
-                _, out = self.model(batch)
-                p = torch.softmax(out / self.args.t, dim=1)
-                loss = (
-                    torch.mean(Entropy(p)) +
-                    torch.sum(p.mean(dim=0) * torch.log(p.mean(dim=0) + self.args.epsilon))
-                )
-                loss.backward()
-                self.optimizer.step()
-            self.model.eval()
+            # adaptation steps for every model in the ensemble
+            for m in self.models:
+                m.train()
+            for step in range(self.args.steps):
+                # zero all optimizers
+                for opt in self.optimizers:
+                    opt.zero_grad()
+                # accumulate loss across ensemble
+                total_loss = 0.0
+                for m in self.models:
+                    _, out = m(batch)
+                    p = torch.softmax(out / self.args.t, dim=1)
+                    loss = (
+                        torch.mean(Entropy(p)) +
+                        torch.sum(p.mean(dim=0) * torch.log(p.mean(dim=0) + self.args.epsilon))
+                    )
+                    total_loss = total_loss + loss
+                total_loss.backward()
+                # step all optimizers
+                for opt in self.optimizers:
+                    opt.step()
+                print(f"    Step {step+1}/{self.args.steps}, total_loss={total_loss.item():.4f}")
+            for m in self.models:
+                m.eval()
 
             # re-infer after adaptation
             softmax_out = self._predict(x_test)
