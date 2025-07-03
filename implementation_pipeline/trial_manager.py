@@ -15,12 +15,14 @@ from datetime import datetime, timedelta
 from utils_gui.read_lsl import EEGTrialStreamer, process_block, ORIGINAL_RATE
 from ui.trial_window_ui import TrialWindow
 from utils_gui.constants import (
-    show_rest_duration,     # ms
+    show_rest_duration,      # ms
     show_fixation_duration, # ms
     show_stimulus_duration, # ms
-    TRIAL_DURATION,         # ms (window length)
+    TRIAL_DURATION,          # ms (window length)
     ArmMovementDuration,     # s
-    DELAY_POST_STIMULUS      # ms
+    DELAY_POST_STIMULUS,     # ms
+    Text_Symbol_Size,
+    Prediction_Text
 )
 from PySide6.QtCore import QObject, Signal, QTimer, Slot
 from control_exoskeleton import ControlExoskeleton, UP, DOWN
@@ -90,7 +92,7 @@ class TrialManager(QObject):
         self.trial = TrialWindow()
         self.trial.rest1_started.connect(self._on_rest1)
         self.trial.fixation_started.connect(self._log_fixation)
-        self.trial.stimulus_started.connect(self._on_stimulus)   # trigger delayed segmentation
+        self.trial.stimulus_started.connect(self._on_stimulus)      # trigger delayed segmentation
         self.trial.trial_finished.connect(self._on_trial_finished)
 
         # start first trial
@@ -126,9 +128,9 @@ class TrialManager(QObject):
 
     def _prepare_and_start_trial(self, trial_idx):
         self.trial.set_trial_counter(trial_idx + 1, self.total)
-        from utils_gui.constants import Cross_Symbol, Stimulus_Symbol
+        from utils_gui.constants import Stimulus_Symbol, No_Stimulus_Symbol
         want = self.stimuli_sequence[trial_idx]
-        sym  = Stimulus_Symbol if want == 'stimulus' else Cross_Symbol
+        sym  = Stimulus_Symbol if want == 'stimulus' else No_Stimulus_Symbol
         self.trial.set_stimulus_symbol(sym)
 
         logger.info(f"[Trial {trial_idx+1}] UI start at {datetime.now().time()}, symbol='{sym}'")
@@ -190,9 +192,9 @@ class TrialManager(QObject):
 
             # write EDF...
             edf_fname = os.path.join(self.ui.out_dir, f"trial_{idx}_raw.edf")
-            data       = raw.T
-            n_ch       = data.shape[0]
-            info       = np.iinfo(np.int16)
+            data      = raw.T
+            n_ch      = data.shape[0]
+            info      = np.iinfo(np.int16)
             dmin, dmax = int(info.min), int(info.max)
             gmin, gmax = float(data.min()), float(data.max())
 
@@ -243,13 +245,21 @@ class TrialManager(QObject):
             t_s   = TRIAL_DURATION / 1000.0
             start = datetime.now().time()
             logger.info(f"[Trial {idx}] _read_fixation: start raw collect at {start} for {t_s:.3f}s")
+            import time as _time  # local import to avoid shadowing
+            t0 = _time.perf_counter()
             raw_block = self.streamer._collect_raw(t_s)
-            logger.info(f"[Trial {idx}] raw_block.shape={raw_block.shape}")
+            t1 = _time.perf_counter()
+            logger.info(f"[Trial {idx}] raw_block.shape={raw_block.shape} (read: {(t1-t0):.3f}s)")
+            t2 = _time.perf_counter()
             fix_data  = process_block(raw_block, self.streamer.b_notch, self.streamer.a_notch, self.streamer.sos_bp)
-            logger.info(f"[Trial {idx}] fix_data.shape after processing={fix_data.shape}")
+            t3 = _time.perf_counter()
+            logger.info(f"[Trial {idx}] fix_data.shape after processing={fix_data.shape} (processing: {(t3-t2):.3f}s)")
             fname = os.path.join(self.ui.out_dir, f"trial_{idx}_fixation.npy")
+            t4 = _time.perf_counter()
             np.save(fname, fix_data)
-            logger.info(f"[Trial {idx}] Saved fixation data to {fname}")
+            t5 = _time.perf_counter()
+            logger.info(f"[Trial {idx}] Saved fixation data to {fname} (saving: {(t5-t4):.3f}s)")
+            logger.info(f"[Trial {idx}] Timing summary: read={t1-t0:.3f}s, process={t3-t2:.3f}s, save={t5-t4:.3f}s, total={t5-t0:.3f}s")
             self.fixations_data.append(fix_data)
             self.fixation_data_ready.emit(idx, fix_data)
 
@@ -257,22 +267,25 @@ class TrialManager(QObject):
 
     @Slot(int, object)
     def _schedule_prediction(self, idx, fix_data):
-        fire_time = datetime.now() + timedelta(milliseconds=show_stimulus_duration)
-        logger.info(f"[Trial {idx}] _schedule_prediction: will fire at {fire_time.time()}")
+        """
+        [FIXED] This function previously contained a bug that introduced a long,
+        unnecessary delay. The QTimer.singleShot has been removed to allow
+        the prediction to start immediately after data collection.
+        """
+        logger.info(f"[Trial {idx}] _schedule_prediction: firing immediately.")
         self.movement_events[idx - 1].clear()
-        QTimer.singleShot(
-            show_stimulus_duration,
-            lambda: threading.Thread(
-                target=self._predict_on_fixation,
-                args=(idx, fix_data),
-                daemon=True
-            ).start()
-        )
+        
+        # Run the prediction in a new thread without the unnecessary delay
+        threading.Thread(
+            target=self._predict_on_fixation,
+            args=(idx, fix_data),
+            daemon=True
+        ).start()
 
     @Slot()
     def _on_prediction_started(self):
         logger.info(f"[{datetime.now().time()}] Prediction message displayed")
-        self.trial.show_message("Prediction")
+        self.trial.show_message(Prediction_Text)
 
     def control_exoskeleton(self, idx, label):
         logger.info(f"[Trial {idx}] control_exoskeleton: predicted label = {label}")
@@ -287,12 +300,16 @@ class TrialManager(QObject):
             time.sleep(delay)
 
     def _predict_on_fixation(self, idx, fix_data):
+        import time as _time  # local import to avoid shadowing
         start = datetime.now().time()
         logger.info(f"[Trial {idx}] _predict_on_fixation started at {start}, input_shape={fix_data.shape}")
         self.prediction_started.emit()
 
+        pred_start = _time.perf_counter()
         pre_lbl, tta_lbl, avg_pre, avg_tta, p_pre, p_tta = self.runner.predict(fix_data)
-        logger.info(f"[Trial {idx}] prediction returned at {datetime.now().time()}")
+        pred_end = _time.perf_counter()
+        pred_duration = pred_end - pred_start
+        logger.info(f"[Trial {idx}] prediction returned at {datetime.now().time()} (prediction: {pred_duration:.3f}s)")
 
         label_to_use = tta_lbl if self.runner.mode in ["tta", "both"] else pre_lbl
         self.trial_results[idx - 1]["predicted_label"] = label_to_use

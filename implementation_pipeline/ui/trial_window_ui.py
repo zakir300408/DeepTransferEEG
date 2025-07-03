@@ -21,7 +21,7 @@ from PySide6.QtGui import QFont, QPalette, QColor
 from PySide6.QtWidgets import QWidget, QLabel, QVBoxLayout
 from implementation_pipeline.utils_gui.constants import (
     show_rest_duration, show_fixation_duration, show_stimulus_duration,
-    Cross_Symbol, Stimulus_Symbol, Cross_Size, Stimulus_Symbol_Size
+    Cross_Symbol, Stimulus_Symbol, No_Stimulus_Symbol, Text_Symbol_Size
 )
 import logging
 
@@ -68,12 +68,12 @@ class TrialWindow(QWidget):
 
         # font for stimuli (+ and box)
         self.stimulus_font = QFont()
-        self.stimulus_font.setPointSize(Stimulus_Symbol_Size)
+        self.stimulus_font.setPointSize(Text_Symbol_Size)
         self.stimulus_font.setBold(True)
 
         # font for messages like "Prediction"
         self.message_font = QFont()
-        self.message_font.setPointSize(128)
+        self.message_font.setPointSize(Text_Symbol_Size)
         self.message_font.setBold(True)
 
         # sequence: (duration_ms, handler)
@@ -90,9 +90,10 @@ class TrialWindow(QWidget):
 
     def start(self):
         """Begin (or restart) the trial sequence."""
-        self.current_step = -1                      # reset sequence
+        self.timer.stop()                         # Stop any running timer to prevent overlap
+        self.current_step = -1                    # reset sequence
         self.counter_label.raise_()
-        self.showFullScreen()                       # ensure it's visible
+        self.showFullScreen()                     # ensure it's visible
         self._next_step()
 
     def set_trial_counter(self, current: int, total: int):
@@ -101,18 +102,35 @@ class TrialWindow(QWidget):
         self.counter_label.show()
 
     def show_message(self, message: str):
-        """Display a custom message with a different font."""
+        """Display a custom message with a different font and restore BG."""
+        # restore black background for prediction window
+        pal = self.palette()
+        pal.setColor(QPalette.Window, QColor("black"))
+        self.setPalette(pal)
+
         logger.info(f"Displaying message: {message}")
         self.label.setFont(self.message_font)
         self.label.setText(message)
         self.label.show()
 
     def _show_rest1(self):
+        # restore black background
+        pal = self.palette()
+        pal.setColor(QPalette.Window, QColor("black"))
+        self.setPalette(pal)
+
         logger.info("Rest1 started")
-        self.label.hide()
+        self.label.setFont(self.message_font)  # Use the message font for "休息"
+        self.label.setText("休息")             # Display the text "休息"
+        self.label.show()
         self.rest1_started.emit()
 
     def _show_fixation(self):
+        # restore black background
+        pal = self.palette()
+        pal.setColor(QPalette.Window, QColor("black"))
+        self.setPalette(pal)
+
         logger.info("Fixation started")
         self.label.setFont(self.stimulus_font)
         self.label.setText(Cross_Symbol)
@@ -121,6 +139,16 @@ class TrialWindow(QWidget):
 
     def _show_arrow(self):
         """Called at t = rest+fixation to display the 'stimulus' symbol."""
+        # color-code only during the arrow/stim window
+        pal = self.palette()
+        if self.stimulus_symbol == No_Stimulus_Symbol:
+            pal.setColor(QPalette.Window, QColor(139, 0, 0))    # darker red for no-stim
+        elif self.stimulus_symbol == Stimulus_Symbol:
+            pal.setColor(QPalette.Window, QColor(0, 100, 0))    # dark green for stimulus
+        else:
+            pal.setColor(QPalette.Window, QColor("black"))      # fallback
+        self.setPalette(pal)
+
         logger.info("Stimulus started")
         self.label.setFont(self.stimulus_font)
         # use whatever was set via set_stimulus_symbol()
@@ -129,7 +157,7 @@ class TrialWindow(QWidget):
         self.stimulus_started.emit()
         
     def set_stimulus_symbol(self, symbol: str):
-        """Override the symbol shown during the stimulus period."""
+        """Override the symbol shown; background set later in _show_arrow."""
         self.stimulus_symbol = symbol
 
     @Slot()

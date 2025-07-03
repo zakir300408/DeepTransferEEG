@@ -6,17 +6,20 @@ ArmMovementDuration = 8  # seconds, time for the exoskeleton to move arm down
 DELAY_POST_STIMULUS = 500  # ms, delay after stimulus before segmentation
 
 
-Cross_Symbol = "＋"       # Unicode for the fixation cross
+Cross_Symbol = "准备开始"       # Unicode for the fixation cross
 Stimulus_Symbol = "⊞"     # Unicode for square box stimulus in green
+No_Stimulus_Symbol = "别动"
+Prediction_Text = "Prediction (休息)"
 
 #unicode for plus sign with a hollow
 
 Cross_Size = 512   # Font size for fixation cross and stimulus
+Text_Symbol_Size = 200  # Font size for text symbols
 Stimulus_Symbol_Size = 512  # Font size for square box
 
 
 ### MODEL SPECIFIC CONSTANTS ###
-SEEDS = [2, 3,4, 5, 6, 7]  # Seeds for ensemble models
+SEEDS = [2, 3, 4, 5, 6, 7]  # Seeds for ensemble models
 SAMPLE_RATE = 100  # Sample rate for EEG data in Hz
 LR = 0.0001
 CHN = 27
