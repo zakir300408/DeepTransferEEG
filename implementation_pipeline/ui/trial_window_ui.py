@@ -1,30 +1,27 @@
-"""
-trial_window.py
----------------
-Fullscreen stimulus window for a single trial with arrow cue.
-
-Timeline (total 11 s)
-0–4 s   : black “rest”
-4–5 s   : white fixation “+”
-5–11 s  : arrow cue (← or →)
-
-Signals
--------
-rest1_started()
-fixation_started()
-stimulus_started()
-trial_finished()
-"""
+# trial_window.py
+# ---------------
+# Fullscreen stimulus window for a single trial with arrow cue.
+#
+# Timeline (total 11 s)
+# 0–4 s   : black “rest”
+# 4–5 s   : white fixation “+”
+# 5–11 s  : arrow cue (← or →) or GIF
+#
+# Signals
+# -------
+# rest1_started()
+# fixation_started()
+# stimulus_started()
+# trial_finished()
 
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QFont, QPalette, QColor
+from PySide6.QtGui import QFont, QPalette, QColor, QMovie
 from PySide6.QtWidgets import QWidget, QLabel, QVBoxLayout
 from implementation_pipeline.utils_gui.constants import (
     show_rest_duration, show_fixation_duration, show_stimulus_duration,
-    Cross_Symbol, Stimulus_Symbol, No_Stimulus_Symbol, Text_Symbol_Size
+    Cross_Symbol, Stimulus_Symbol, No_Stimulus_Symbol, Text_Symbol_Size, STIMULUS_GIF_PATH
 )
 import logging
-
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +34,6 @@ class TrialWindow(QWidget):
     trial_finished   = Signal()
 
     def __init__(self, parent=None):
-        """
-        """
         super().__init__(parent)
 
         # full-screen black window
@@ -54,9 +49,10 @@ class TrialWindow(QWidget):
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.setSpacing(0)
 
-        # central label for fixation or arrow
+        # central label for fixation, arrow, or GIF
         self.label = QLabel(self)
         self.label.setAlignment(Qt.AlignCenter)
+        self.label.setScaledContents(True)  # <-- allow scaling to fill
         self.layout.addWidget(self.label)
         self.label.hide()
 
@@ -76,6 +72,9 @@ class TrialWindow(QWidget):
         self.message_font.setPointSize(Text_Symbol_Size)
         self.message_font.setBold(True)
 
+        # for playing the GIF
+        self.movie = None
+
         # sequence: (duration_ms, handler)
         self.sequence = [
             (show_rest_duration, self._show_rest1),
@@ -90,10 +89,13 @@ class TrialWindow(QWidget):
 
     def start(self):
         """Begin (or restart) the trial sequence."""
-        self.timer.stop()                         # Stop any running timer to prevent overlap
-        self.current_step = -1                    # reset sequence
+        # ensure any running GIF is stopped
+        if self.movie:
+            self.movie.stop()
+        self.timer.stop()
+        self.current_step = -1
         self.counter_label.raise_()
-        self.showFullScreen()                     # ensure it's visible
+        self.showFullScreen()
         self._next_step()
 
     def set_trial_counter(self, current: int, total: int):
@@ -103,7 +105,6 @@ class TrialWindow(QWidget):
 
     def show_message(self, message: str):
         """Display a custom message with a different font and restore BG."""
-        # restore black background for prediction window
         pal = self.palette()
         pal.setColor(QPalette.Window, QColor("black"))
         self.setPalette(pal)
@@ -114,19 +115,17 @@ class TrialWindow(QWidget):
         self.label.show()
 
     def _show_rest1(self):
-        # restore black background
         pal = self.palette()
         pal.setColor(QPalette.Window, QColor("black"))
         self.setPalette(pal)
 
         logger.info("Rest1 started")
-        self.label.setFont(self.message_font)  # Use the message font for "休息"
-        self.label.setText("休息")             # Display the text "休息"
+        self.label.setFont(self.message_font)
+        self.label.setText("休息")
         self.label.show()
         self.rest1_started.emit()
 
     def _show_fixation(self):
-        # restore black background
         pal = self.palette()
         pal.setColor(QPalette.Window, QColor("black"))
         self.setPalette(pal)
@@ -138,24 +137,40 @@ class TrialWindow(QWidget):
         self.fixation_started.emit()
 
     def _show_arrow(self):
-        """Called at t = rest+fixation to display the 'stimulus' symbol."""
-        # color-code only during the arrow/stim window
+        """Called at t = rest+fixation to display the stimulus (arrow text or GIF)."""
+        # set background color
         pal = self.palette()
         if self.stimulus_symbol == No_Stimulus_Symbol:
-            pal.setColor(QPalette.Window, QColor(139, 0, 0))    # darker red for no-stim
+            pal.setColor(QPalette.Window, QColor(139, 0, 0))
         elif self.stimulus_symbol == Stimulus_Symbol:
-            pal.setColor(QPalette.Window, QColor(0, 100, 0))    # dark green for stimulus
+            pal.setColor(QPalette.Window, QColor(0, 100, 0))
         else:
-            pal.setColor(QPalette.Window, QColor("black"))      # fallback
+            pal.setColor(QPalette.Window, QColor("black"))
         self.setPalette(pal)
 
         logger.info("Stimulus started")
-        self.label.setFont(self.stimulus_font)
-        # use whatever was set via set_stimulus_symbol()
-        self.label.setText(self.stimulus_symbol)
+
+        if self.stimulus_symbol == Stimulus_Symbol:
+            # stop any previous movie
+            if self.movie:
+                self.movie.stop()
+            # load, scale, and start the GIF
+            self.movie = QMovie(STIMULUS_GIF_PATH)
+            self.movie.setScaledSize(self.label.size())   # <-- scale to label size
+            self.label.setMovie(self.movie)
+            self.movie.start()
+        else:
+            # stop GIF if it was playing
+            if self.movie:
+                self.movie.stop()
+                self.movie = None
+            # fallback to text stimulus
+            self.label.setFont(self.stimulus_font)
+            self.label.setText(self.stimulus_symbol)
+
         self.label.show()
         self.stimulus_started.emit()
-        
+
     def set_stimulus_symbol(self, symbol: str):
         """Override the symbol shown; background set later in _show_arrow."""
         self.stimulus_symbol = symbol
@@ -164,8 +179,10 @@ class TrialWindow(QWidget):
     def _next_step(self):
         self.current_step += 1
         if self.current_step >= len(self.sequence):
+            # stop GIF when stimulus period ends
+            if self.movie:
+                self.movie.stop()
             self.trial_finished.emit()
-            # do not close so we can restart on demand
             return
 
         duration, handler = self.sequence[self.current_step]
@@ -178,7 +195,6 @@ if __name__ == "__main__":
     import sys
 
     app = QApplication(sys.argv)
-    # example: show stimulus cue
     win = TrialWindow()
     win.start()
     sys.exit(app.exec())

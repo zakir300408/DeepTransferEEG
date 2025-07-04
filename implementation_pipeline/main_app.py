@@ -27,16 +27,29 @@ def main():
         if getattr(ui, "out_dir", None) and not hasattr(app, "_log_redirected"):
             log_path = os.path.join(ui.out_dir, "log.txt")
             log_file = open(log_path, "a", buffering=1)
-            sys.stdout = log_file
-            sys.stderr = log_file
-            # Set up logging to file (root logger)
-            logging.basicConfig(
-                level=logging.INFO,
-                format="%(asctime)s - %(levelname)s - %(message)s",
-                handlers=[
-                    logging.FileHandler(log_path, mode="a", encoding="utf-8"),
-                ]
-            )
+
+            # Tee stdout/stderr to both console and file
+            orig_stdout, orig_stderr = sys.stdout, sys.stderr
+            class Tee:
+                def __init__(self, *writers):
+                    self.writers = writers
+                def write(self, msg):
+                    for w in self.writers:
+                        w.write(msg)
+                def flush(self):
+                    for w in self.writers:
+                        w.flush()
+            sys.stdout = Tee(orig_stdout, log_file)
+            sys.stderr = Tee(orig_stderr, log_file)
+
+            import logging as _logging
+            root = _logging.getLogger()
+            # add a FileHandler alongside existing console handlers
+            fh = _logging.FileHandler(log_path, mode="a", encoding="utf-8")
+            fh.setLevel(_logging.INFO)
+            fh.setFormatter(_logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+            root.addHandler(fh)
+
             app._log_redirected = True  # Prevent multiple redirections
 
     # Connect after_save to be called after data is saved
