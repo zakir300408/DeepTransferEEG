@@ -57,7 +57,7 @@ class EnsembleRunner:
 
 if __name__ == "__main__":
     runner = EnsembleRunner(seeds=SEEDS, mode="both")
-    data_dir = r"E:\Exoskeleton_DL\DeepTransferEEG\iplementaion_runn\penteng_2_20250702_151500"
+    data_dir = r"E:\Exoskeleton_DL\DeepTransferEEG\iplementaion_runn\Zhao Xu_1_20250701_171837"
     files = sorted(glob.glob(os.path.join(data_dir, "trial_*_fixation.npy")))
 
     # load and validate ground truth + predicted labels
