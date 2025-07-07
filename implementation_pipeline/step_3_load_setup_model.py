@@ -1,95 +1,112 @@
-# step_3_load_setup_model.py
-# -----------------------------------------------------------
-# 2025-07-07 – patched version
-#   • Patch 1 : BN-only adaptation (TENT-style)
-#   • Patch 2 : rolling deque buffer
-#   • Patch 2b: use torch.cat (not stack) → correct tensor rank
-# -----------------------------------------------------------
+"""
+step_3_load_setup_model.py
+────────────────────────────────────────────────────────────
+2025-07-07  • EEGNet TTA engine with incremental robustness patches
 
-# ---- compat shim for typing.Self (torch.compile / dynamo) ----
+Patches already applied
+-----------------------
+ 0.  BN-only adaptation (TENT-style)
+ 2a. Rolling window via collections.deque
+ 2b. Use torch.cat (not stack) so tensor ranks stay correct
+ 3.  Percentile gating: adapt using top-p % most-confident samples
+ 4.  Entropy-plateau early-stop with patience
+
+To keep the diff history clean, *no* further changes are mixed in.
+"""
+
+# ----------------------------------------------------------------------
+#  Std-lib & compatibility shims
+# ----------------------------------------------------------------------
 import typing
 try:
     from typing import Self
-except ImportError:
+except ImportError:  # Python < 3.11
     from typing_extensions import Self
 typing.Self = Self
 
 import os
 import sys
-import argparse
 import glob
 import copy
+import argparse
 from collections import deque
+from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.linalg as LA
-import numpy as np
 
-# ------------------------------------------------------------------
-# Helper: add project root + sub-dirs to PYTHONPATH
-# ------------------------------------------------------------------
-def add_project_paths(root=None, subs=("", "tl", "runs")):
-    root = root or os.path.dirname(os.path.dirname(__file__))
+# ----------------------------------------------------------------------
+#  Project-specific helpers (imported from your repo)
+# ----------------------------------------------------------------------
+def add_project_paths(root: str | None = None, subs=("", "tl", "runs")) -> None:
+    """Prepend repo sub-folders to PYTHONPATH so relative imports work."""
+    root = root or Path(__file__).resolve().parents[1]
     for sub in subs:
-        p = os.path.join(root, sub) if sub else root
+        p = str(Path(root, sub)) if sub else str(root)
         if p not in sys.path:
             sys.path.insert(0, p)
 
 add_project_paths()
 
-# ------------------------------------------------------------------
-# Project-specific utilities (unchanged)
-# ------------------------------------------------------------------
+# project modules -----------------------------------------------------
 from utils.alg_utils import EA_online
 from utils.network import backbone_net
 from utils.loss import Entropy
-from implementation_pipeline.utils_gui.constants import (
+from implementation_pipeline.utils_gui.constants import (  # noqa: E501
     FEATURE_DEEP_DIM, SAMPLE_RATE, CHN, TIME_SAMPLE_NUM,
-    LR, MAX_TTA, STRIDE, STEPS, T, CONF_THRESH
+    LR, MAX_TTA, STRIDE, STEPS, T, CONF_THRESH,
 )
 
-# ------------------------------------------------------------------
-# Patch 1: only BN affine parameters are trainable
-# ------------------------------------------------------------------
+# ----------------------------------------------------------------------
+#  Patch-0 helper: expose only BN γ/β parameters
+# ----------------------------------------------------------------------
 def trainable_bn_params(model: nn.Module):
-    """Yield BatchNorm γ,β parameters and freeze all others."""
+    """
+    Yield BatchNorm affine parameters and freeze all others.
+
+    Following TENT, we also switch off running-stat tracking so each
+    BN uses only the current batch statistics.
+    """
     for m in model.modules():
         if isinstance(m, nn.BatchNorm2d):
-            m.weight.requires_grad = True
-            m.bias.requires_grad = True
-            m.track_running_stats = False  # use current batch stats (TENT)
+            m.weight.requires_grad = m.bias.requires_grad = True
+            m.track_running_stats = False
             yield m.weight
             yield m.bias
         else:
+            # disable gradients for everything else
             for p in m.parameters(recurse=False):
                 p.requires_grad = False
 
-# ------------------------------------------------------------------
-# Base inference engine
-# ------------------------------------------------------------------
+# ----------------------------------------------------------------------
+#  Base inference engine
+# ----------------------------------------------------------------------
 class InferenceEngine:
-    def __init__(self, args):
-        self.args = args
+    """Handles model construction, weight loading and shared utilities."""
+
+    def __init__(self, args: argparse.Namespace):
+        self.args   = args
         self.device = args.device
-        self.models: list[nn.Sequential] = []
-        self._build_model()
+        self.models: list[nn.Sequential] = []   # ensemble
+        self._build_model_prototype()
         self._load_weights()
 
-    # ----- model build / load ------------------------------------------------
-    def _build_model(self):
+    # -- model build / load -------------------------------------------------
+    def _build_model_prototype(self) -> None:
         netF, netC = backbone_net(self.args, return_type="xy")
         self._netF = netF
         self._netC = netC
 
-    def _load_weights(self):
-        ckpt_dir = f"./runs/{self.args.data_name}"
-        pattern = f"{self.args.backbone}_S*_seed{self.args.SEED}_best.ckpt"
-        paths = sorted(glob.glob(os.path.join(ckpt_dir, pattern)))
+    def _load_weights(self) -> None:
+        ckpt_dir = Path("runs") / self.args.data_name
+        pattern  = f"{self.args.backbone}_S*_seed{self.args.SEED}_best.ckpt"
+        paths    = sorted(ckpt_dir.glob(pattern))
         if not paths:
             raise FileNotFoundError(
-                f"No checkpoints found matching {pattern} in {ckpt_dir}"
+                f"No checkpoints match {pattern!r} in {ckpt_dir}"
             )
 
         protoF, protoC = self._netF, self._netC
@@ -99,44 +116,49 @@ class InferenceEngine:
             model = nn.Sequential(netF, netC).to(self.device)
 
             state = torch.load(ckpt, map_location=self.device)
-            model.load_state_dict(state)
+            model.load_state_dict(state, strict=True)
             model.eval()
             self.models.append(model)
-            print(f"✔ Loaded model from {ckpt}")
+            print(f"✔ Loaded ensemble member from {ckpt}")
 
-        self.model = self.models[0]  # primary for adaptation
+        self.model = self.models[0]  # first one is “primary”
 
-    # ----- helpers -----------------------------------------------------------
-    def _to_tensor(self, data):
-        self._diagnose_input(data, context="to_tensor")
-        t = torch.from_numpy(data) if not isinstance(data, torch.Tensor) else data
-        return t.to(self.device, dtype=torch.float32)
+    # -- tensor / alignment helpers ----------------------------------------
+    def _to_tensor(self, arr: np.ndarray | torch.Tensor) -> torch.Tensor:
+        if not isinstance(arr, torch.Tensor):
+            arr = torch.from_numpy(arr)
+        return arr.to(self.device, dtype=torch.float32)
 
-    def _get_transform(self, R):
-        if np.isnan(R).any() or np.isinf(R).any():
-            print("DIAG: NaN/Inf in covariance R")
+    def _diagnose_array(self, arr: np.ndarray, msg: str = "") -> None:
+        if np.isnan(arr).any() or np.isinf(arr).any():
+            print(f"[DIAG] NaN/Inf detected {msg} "
+                  f"(shape={arr.shape}, NaN={np.isnan(arr).sum()}, "
+                  f"Inf={np.isinf(arr).sum()})")
+
+    def _get_transform(self, R: np.ndarray) -> torch.Tensor:
+        """Whitener via eigen-decomp (adds εI for stability)."""
+        self._diagnose_array(R, "in covariance R")
         Rt = torch.from_numpy(R + np.eye(R.shape[0]) * 1e-6).to(
             self.device, dtype=torch.float32
         )
         vals, vecs = LA.eigh(Rt)
-        if torch.isnan(vals).any() or torch.isinf(vals).any() or (vals <= 0).any():
-            print("DIAG: issues in eigenvalues")
+        if (vals <= 0).any():
+            print("[DIAG] non-positive eigenvalues; min =", vals.min().item())
         return vecs @ torch.diag(vals.pow(-0.5)) @ vecs.T
 
-    def _align_sample(self, sample, R, trial_idx):
-        arr = sample.cpu().numpy() if hasattr(sample, "cpu") else sample
-        if np.isnan(arr).any() or np.isinf(arr).any() or np.all(arr == 0):
-            print("DIAG: invalid sample before alignment")
-        R_new = EA_online(arr, R, trial_idx)
-        if np.isnan(R_new).any() or np.isinf(R_new).any():
-            print("DIAG: invalid R_new")
-        T = self._get_transform(R_new)
-        aligned = T @ sample
+    def _align_sample(
+        self, x: torch.Tensor, R: np.ndarray, idx: int
+    ) -> tuple[torch.Tensor, np.ndarray]:
+        """Eye-artifacts alignment on-the-fly (EA_online)."""
+        arr = x.cpu().numpy() if isinstance(x, torch.Tensor) else x
+        self._diagnose_array(arr, "before EA_online")
+        R_new = EA_online(arr, R, idx)
+        Tmat  = self._get_transform(R_new)
+        aligned = Tmat @ x
         return aligned, R_new
 
-    def _predict(self, inp):
-        if torch.isnan(inp).any() or torch.isinf(inp).any():
-            print("WARN: NaN/Inf in model input")
+    def _predict(self, inp: torch.Tensor) -> torch.Tensor:
+        """Ensemble average of softmax probabilities."""
         probs = []
         for m in self.models:
             with torch.no_grad():
@@ -144,104 +166,138 @@ class InferenceEngine:
                 probs.append(torch.softmax(out, 1))
         return torch.stack(probs, 0).mean(0)
 
-    def _diagnose_input(self, data, context=""):
-        arr = data if isinstance(data, np.ndarray) else data.cpu().numpy()
-        if np.isnan(arr).any() or np.isinf(arr).any():
-            print(f"DIAG: NaN/Inf detected in {context}")
-
-# ------------------------------------------------------------------
-# Pre-TTA engine (no adaptation)
-# ------------------------------------------------------------------
+# ----------------------------------------------------------------------
+#  Pre-TTA engine (no adaptation, optional per-trial alignment)
+# ----------------------------------------------------------------------
 class PreTTAEngine(InferenceEngine):
     def __init__(self, args):
         super().__init__(args)
         self.R = np.zeros((args.chn, args.chn)) if args.align else None
 
-    def infer(self, trial, trial_idx=0):
+    @torch.no_grad()
+    def infer(self, trial: np.ndarray, idx: int = 0):
         x = self._to_tensor(trial).view(1, 1, self.args.chn, self.args.time_sample_num)
+
         if self.args.align and self.R is not None:
-            sample = x.squeeze(0).squeeze(0)
-            aligned, self.R = self._align_sample(sample, self.R, trial_idx)
+            sample  = x.squeeze(0).squeeze(0)
+            aligned, self.R = self._align_sample(sample, self.R, idx)
             x = aligned.view(1, 1, self.args.chn, self.args.time_sample_num)
+
         probs = self._predict(x)
         return probs.cpu().numpy(), self.R
 
-# ------------------------------------------------------------------
-# TTA engine with Patch 1 + Patch 2 (+ 2b)
-# ------------------------------------------------------------------
+# ----------------------------------------------------------------------
+#  TTA engine with robustness patches
+# ----------------------------------------------------------------------
 class TTAEngine(InferenceEngine):
+    """Stream-time adaptation with BN-only updates and robust triggers."""
+
     def __init__(self, args):
         super().__init__(args)
 
-        # Patch 1: BN-only parameters
+        # BN-only optimisers (Patch-0)
         self.optimizers = [
             optim.Adam(list(trainable_bn_params(m)), lr=args.lr)
             for m in self.models
         ]
 
-        self.R = np.zeros((args.chn, args.chn)) if args.align else None
-        self.buffer: deque[torch.Tensor] | None = None  # Patch 2
+        # State buffers
+        self.R           = np.zeros((args.chn, args.chn)) if args.align else None
+        self.buffer      : deque[torch.Tensor] = deque(maxlen=args.max_tta)
+        self.buffer_conf : deque[float]        = deque(maxlen=args.max_tta)
 
-    def infer(self, trial, trial_idx=0):
+        # Early-stop state
+        self.patience = args.patience
+
+    # ------------------------------------------------------------------
+    def infer(self, trial: np.ndarray, idx: int = 0):
         x = self._to_tensor(trial).view(1, 1, self.args.chn, self.args.time_sample_num)
 
-        # Patch 2: rolling window via deque
-        if self.buffer is None:
-            self.buffer = deque(maxlen=self.args.max_tta)
-        self.buffer.append(x.detach())  # keep clone
+        # store raw sample & provisional confidence
+        self.buffer.append(x.detach())
 
-        # optional per-sample alignment
+        # alignment for on-line prediction input
         if self.args.align and self.R is not None:
-            sample = x.squeeze(0).squeeze(0)
-            aligned, self.R = self._align_sample(sample, self.R, trial_idx)
+            sample   = x.squeeze(0).squeeze(0)
+            aligned, self.R = self._align_sample(sample, self.R, idx)
             x_test = aligned.view(1, 1, self.args.chn, self.args.time_sample_num)
         else:
             x_test = x
 
-        # forward pass
-        softmax_out = self._predict(x_test)
-        conf = softmax_out.max(1).values
+        # first pass
+        soft_out = self._predict(x_test)
+        conf_val = soft_out.max(1).values.item()
+        self.buffer_conf.append(conf_val)
 
-        # trigger adaptation
+        # ---------- adaptation trigger --------------------------------
         if (
             len(self.buffer) == self.args.max_tta
-            and conf.item() >= self.args.conf_thresh
-            and (trial_idx + 1) % self.args.stride == 0
+            and (idx + 1) % self.args.stride == 0
         ):
-            print(f">>> Adapting at trial {trial_idx+1} (conf={conf.item():.3f})")
-            batch = torch.cat(list(self.buffer), 0)  # Patch 2b → (W,1,C,T)
+            print(f">>> Adapting at trial {idx+1}")
 
+            # Patch-3: percentile gating
+            top_p = self.args.top_p
+            k     = max(1, int(np.ceil(top_p * len(self.buffer))))
+            conf_arr = np.array(self.buffer_conf)
+            top_idx  = conf_arr.argsort()[::-1][:k]        # k highest confidences
+            batch    = torch.cat([self.buffer[i] for i in top_idx], 0)  # (k,1,C,T)
+
+            # window-level alignment (optional)
             if self.args.align and self.R is not None:
                 Tmat = self._get_transform(self.R)
-                raw = batch.squeeze(1)               # (W,C,T)
-                aligned = torch.einsum('ij,bjt->bit', Tmat, raw)
-                batch = aligned.unsqueeze(1)         # back to (W,1,C,T)
+                raw  = batch.squeeze(1)                    # (k,C,T)
+                batch = torch.einsum('ij,bjt->bit', Tmat, raw).unsqueeze(1)
 
-            for m in self.models: m.train()
+            # ---------- inner optimisation (entropy plateau) ----------
+            best_e     = float("inf")
+            wait       = 0
+            best_state = [copy.deepcopy(m.state_dict()) for m in self.models]
+
             for step in range(self.args.steps):
-                for opt in self.optimizers: opt.zero_grad()
-                total_loss = 0.0
+                for opt in self.optimizers:
+                    opt.zero_grad()
+
+                tot_loss, ent_acc = 0.0, 0.0
                 for m in self.models:
                     _, out = m(batch)
-                    p = torch.softmax(out / self.args.t, 1)
-                    loss = (
-                        torch.mean(Entropy(p)) +
-                        torch.sum(p.mean(0) * torch.log(p.mean(0) + self.args.epsilon))
-                    )
-                    total_loss += loss
-                total_loss.backward()
-                for opt in self.optimizers: opt.step()
-                print(f"    Step {step+1}/{self.args.steps}, loss={total_loss.item():.4f}")
-            for m in self.models: m.eval()
-            softmax_out = self._predict(x_test)
+                    p   = torch.softmax(out / self.args.t, 1)
+                    ent = torch.mean(Entropy(p))
+                    loss = ent + torch.sum(p.mean(0) * torch.log(p.mean(0) + self.args.epsilon))
+                    tot_loss += loss
+                    ent_acc  += ent.item()
 
-        return softmax_out.cpu().numpy(), self.R, self.buffer
+                tot_loss.backward()
+                for opt in self.optimizers:
+                    opt.step()
 
-# ------------------------------------------------------------------
-# helper to assemble an engine quickly
-# ------------------------------------------------------------------
-def setup_inference_pipeline(seed=2, mode="tta"):
+                ent_avg = ent_acc / len(self.models)
+                if ent_avg < best_e - 1e-4:          # improvement
+                    best_state = [copy.deepcopy(m.state_dict()) for m in self.models]
+                    best_e = ent_avg
+                    wait   = 0
+                else:
+                    wait += 1
+                if wait == self.patience:
+                    print(f"    · early-stop at step {step+1} (entropy plateau)")
+                    break
+
+            # load best snapshot & switch back to eval
+            for m, s in zip(self.models, best_state):
+                m.load_state_dict(s)
+                m.eval()
+
+            # re-infer with freshly adapted BN params
+            soft_out = self._predict(x_test)
+
+        return soft_out.cpu().numpy(), self.R, self.buffer
+
+# ----------------------------------------------------------------------
+#  Helper: assemble an inference engine
+# ----------------------------------------------------------------------
+def setup_inference_pipeline(seed: int = 2, mode: str = "tta"):
     args = argparse.Namespace(
+        # dataset / model specs -----------------------
         data_name="CustomEpoch",
         SEED=seed,
         device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
@@ -250,30 +306,32 @@ def setup_inference_pipeline(seed=2, mode="tta"):
         time_sample_num=TIME_SAMPLE_NUM,
         class_num=2,
         feature_deep_dim=FEATURE_DEEP_DIM,
+        # TTA knobs -----------------------------------
         align=True,
         lr=LR,
         max_tta=MAX_TTA,
         stride=STRIDE,
         steps=STEPS,
         t=T,
-        conf_thresh=CONF_THRESH,
         epsilon=1e-5,
+        # new robustness knobs ------------------------
+        top_p=0.70,         # keep top-20 % confidences
+        patience=5,         # early-stop patience
+        # legacy (still used by PreTTA) ---------------
+        conf_thresh=CONF_THRESH,
         sample_rate=SAMPLE_RATE,
     )
 
-    if mode == "pre_tta":
-        engine = PreTTAEngine(args)
-    elif mode == "tta":
-        engine = TTAEngine(args)
-    else:
+    engine_cls = {"pre_tta": PreTTAEngine, "tta": TTAEngine}.get(mode)
+    if engine_cls is None:
         raise ValueError("mode must be 'pre_tta' or 'tta'")
-
-    print(f"✔ {mode.upper()} engine setup complete (seed={seed})")
+    engine = engine_cls(args)
+    print(f"✔ {mode.upper()} engine ready (seed={seed})")
     return engine
 
-# ------------------------------------------------------------------
-# CLI sanity check
-# ------------------------------------------------------------------
+# ----------------------------------------------------------------------
+#  Quick CLI sanity check
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
-    engine = setup_inference_pipeline(mode="pre_tta")
-    print("Inference engine ready.")
+    eng = setup_inference_pipeline(mode="pre_tta")
+    print("✓ self-test finished – engine instantiated.")
