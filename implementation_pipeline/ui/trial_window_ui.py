@@ -104,7 +104,11 @@ class TrialWindow(QWidget):
         self.counter_label.show()
 
     def show_message(self, message: str):
-        """Display a custom message with a different font and restore BG."""
+        # stop GIF now that we're about to show static text
+        if self.movie:
+            self.movie.stop()
+            self.movie = None
+
         pal = self.palette()
         pal.setColor(QPalette.Window, QColor("black"))
         self.setPalette(pal)
@@ -156,7 +160,8 @@ class TrialWindow(QWidget):
                 self.movie.stop()
             # load, scale, and start the GIF
             self.movie = QMovie(STIMULUS_GIF_PATH)
-            self.movie.setScaledSize(self.label.size())   # <-- scale to label size
+            # initial scale to label size
+            self.movie.setScaledSize(self.label.size())
             self.label.setMovie(self.movie)
             self.movie.start()
         else:
@@ -171,6 +176,12 @@ class TrialWindow(QWidget):
         self.label.show()
         self.stimulus_started.emit()
 
+    # ensure GIF always matches label size on resize
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.movie:
+            self.movie.setScaledSize(self.label.size())
+
     def set_stimulus_symbol(self, symbol: str):
         """Override the symbol shown; background set later in _show_arrow."""
         self.stimulus_symbol = symbol
@@ -179,9 +190,7 @@ class TrialWindow(QWidget):
     def _next_step(self):
         self.current_step += 1
         if self.current_step >= len(self.sequence):
-            # stop GIF when stimulus period ends
-            if self.movie:
-                self.movie.stop()
+            # do not stop GIF here; let it keep playing until prediction
             self.trial_finished.emit()
             return
 

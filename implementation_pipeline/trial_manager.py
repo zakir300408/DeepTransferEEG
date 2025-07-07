@@ -117,7 +117,7 @@ class TrialManager(QObject):
         logger.info(f"[Trial {idx}] Stimulus started at {now}")
         # wait 500 ms into the stimulus period before grabbing data
         delay_ms = DELAY_POST_STIMULUS
-        logger.info(f"[Trial {idx}] → Scheduling segmentation in {delay_ms}ms (+0.5s)")
+        logger.info(f"[Trial {idx}] → Scheduling segmentation in {delay_ms}ms")
         QTimer.singleShot(
             delay_ms,
             lambda: (
@@ -303,13 +303,15 @@ class TrialManager(QObject):
         import time as _time  # local import to avoid shadowing
         start = datetime.now().time()
         logger.info(f"[Trial {idx}] _predict_on_fixation started at {start}, input_shape={fix_data.shape}")
-        self.prediction_started.emit()
+        # prediction message will be emitted after model completes
 
         pred_start = _time.perf_counter()
         pre_lbl, tta_lbl, avg_pre, avg_tta, p_pre, p_tta = self.runner.predict(fix_data)
         pred_end = _time.perf_counter()
         pred_duration = pred_end - pred_start
         logger.info(f"[Trial {idx}] prediction returned at {datetime.now().time()} (prediction: {pred_duration:.3f}s)")
+        # now show prediction message
+        self.prediction_started.emit()
 
         label_to_use = tta_lbl if self.runner.mode in ["tta", "both"] else pre_lbl
         self.trial_results[idx - 1]["predicted_label"] = label_to_use

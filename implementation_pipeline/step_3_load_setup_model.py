@@ -10,6 +10,7 @@ Patches already applied
  2b. Use torch.cat (not stack) so tensor ranks stay correct
  3.  Percentile gating: adapt using top-p % most-confident samples
  4.  Entropy-plateau early-stop with patience
+ 5.  Dynamic confidence gating: adapt top_p using entropy history
 
 To keep the diff history clean, *no* further changes are mixed in.
 """
@@ -205,9 +206,25 @@ class TTAEngine(InferenceEngine):
         self.R           = np.zeros((args.chn, args.chn)) if args.align else None
         self.buffer      : deque[torch.Tensor] = deque(maxlen=args.max_tta)
         self.buffer_conf : deque[float]        = deque(maxlen=args.max_tta)
+        
+        # New: Entropy history buffer for dynamic confidence gating
+        self.entropy_history : deque[float] = deque(maxlen=args.max_tta)
 
         # Early-stop state
         self.patience = args.patience
+
+    def _calculate_dynamic_top_p(self):
+        """Calculate dynamic top_p based on entropy history quantile."""
+        if len(self.entropy_history) < 3:  # Need minimum history
+            return self.args.top_p  # Fall back to default
+            
+        # Calculate 75th percentile of entropy history
+        entropy_arr = np.array(self.entropy_history)
+        p75 = np.quantile(entropy_arr, 0.75)
+        
+        # Bound between 0.1 and 0.9
+        dynamic_p = min(0.9, max(0.1, p75))
+        return dynamic_p
 
     # ------------------------------------------------------------------
     def infer(self, trial: np.ndarray, idx: int = 0):
@@ -228,6 +245,11 @@ class TTAEngine(InferenceEngine):
         soft_out = self._predict(x_test)
         conf_val = soft_out.max(1).values.item()
         self.buffer_conf.append(conf_val)
+        
+        # Calculate and store entropy for dynamic gating
+        with torch.no_grad():
+            entropy_val = Entropy(soft_out).item()
+            self.entropy_history.append(entropy_val)
 
         # ---------- adaptation trigger --------------------------------
         if (
@@ -236,9 +258,12 @@ class TTAEngine(InferenceEngine):
         ):
             print(f">>> Adapting at trial {idx+1}")
 
-            # Patch-3: percentile gating
-            top_p = self.args.top_p
-            k     = max(1, int(np.ceil(top_p * len(self.buffer))))
+            # Dynamic confidence gating: use entropy history to determine top_p
+            dynamic_top_p = self._calculate_dynamic_top_p()
+            print(f"    · Using dynamic top_p: {dynamic_top_p:.3f}")
+            
+            # Select top samples based on dynamic threshold
+            k = max(1, int(np.ceil(dynamic_top_p * len(self.buffer))))
             conf_arr = np.array(self.buffer_conf)
             top_idx  = conf_arr.argsort()[::-1][:k]        # k highest confidences
             batch    = torch.cat([self.buffer[i] for i in top_idx], 0)  # (k,1,C,T)
@@ -315,8 +340,8 @@ def setup_inference_pipeline(seed: int = 2, mode: str = "tta"):
         t=T,
         epsilon=1e-5,
         # new robustness knobs ------------------------
-        top_p=0.70,         # keep top-20 % confidences
-        patience=5,         # early-stop patience
+        top_p=0.6,         # initial/fallback value - now dynamically adjusted
+        patience=6,         # early-stop patience
         # legacy (still used by PreTTA) ---------------
         conf_thresh=CONF_THRESH,
         sample_rate=SAMPLE_RATE,
