@@ -30,8 +30,8 @@ TIME_SAMPLE_NUM = 725
 FEATURE_DEEP_DIM = 704
 MAX_TTA=8  # was 10, reduced to trigger adaptation every trial for debug
 STRIDE=1
-STEPS=1
-T=1.5
+STEPS=3
+T=2
 CONF_THRESH=0.5
 
 

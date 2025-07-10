@@ -158,13 +158,13 @@ class InferenceEngine:
         aligned = Tmat @ x
         return aligned, R_new
 
-    def _predict(self, inp: torch.Tensor) -> torch.Tensor:
-        """Ensemble average of softmax probabilities."""
+    def _predict(self, inp: torch.Tensor, temp: float = 1.0) -> torch.Tensor:
+        """Ensemble average of softmax probabilities with temperature."""
         probs = []
         for m in self.models:
             with torch.no_grad():
                 _, out = m(inp)
-                probs.append(torch.softmax(out, 1))
+                probs.append(torch.softmax(out / temp, 1))
         return torch.stack(probs, 0).mean(0)
 
 # ----------------------------------------------------------------------
@@ -185,7 +185,7 @@ class PreTTAEngine(InferenceEngine):
             x = aligned.view(1, 1, self.args.chn, self.args.time_sample_num)
 
         probs = self._predict(x)
-        return probs.cpu().numpy(), self.R
+        return probs.cpu().numpy(), self.R, None
 
 # ----------------------------------------------------------------------
 #  TTA engine with robustness patches
@@ -217,13 +217,11 @@ class TTAEngine(InferenceEngine):
         """Calculate dynamic top_p based on entropy history quantile."""
         if len(self.entropy_history) < 3:  # Need minimum history
             return self.args.top_p  # Fall back to default
-            
-        # Calculate 75th percentile of entropy history
+
         entropy_arr = np.array(self.entropy_history)
-        p75 = np.quantile(entropy_arr, 0.75)
-        
-        # Bound between 0.1 and 0.9
-        dynamic_p = min(0.9, max(0.1, p75))
+        q75 = np.quantile(entropy_arr, 0.75)
+        dynamic_p = 1.0 - q75                      # invert entropy → confidence
+        dynamic_p = min(0.95, max(0.1, dynamic_p)) # clip between 0.1 and 0.9
         return dynamic_p
 
     # ------------------------------------------------------------------
@@ -241,8 +239,8 @@ class TTAEngine(InferenceEngine):
         else:
             x_test = x
 
-        # first pass
-        soft_out = self._predict(x_test)
+        # first pass (apply temperature)
+        soft_out = self._predict(x_test, self.args.t)
         conf_val = soft_out.max(1).values.item()
         self.buffer_conf.append(conf_val)
         
@@ -312,10 +310,10 @@ class TTAEngine(InferenceEngine):
                 m.load_state_dict(s)
                 m.eval()
 
-            # re-infer with freshly adapted BN params
-            soft_out = self._predict(x_test)
+            # re-infer after adaptation (consistent temperature)
+            soft_out = self._predict(x_test, self.args.t)
 
-        return soft_out.cpu().numpy(), self.R, self.buffer
+        return soft_out.cpu().numpy(), self.R, None
 
 # ----------------------------------------------------------------------
 #  Helper: assemble an inference engine
@@ -358,5 +356,7 @@ def setup_inference_pipeline(seed: int = 2, mode: str = "tta"):
 #  Quick CLI sanity check
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
+    eng = setup_inference_pipeline(mode="pre_tta")
+    print("✓ self-test finished – engine instantiated.")
     eng = setup_inference_pipeline(mode="pre_tta")
     print("✓ self-test finished – engine instantiated.")

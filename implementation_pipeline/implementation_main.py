@@ -4,16 +4,18 @@ import glob
 import json
 
 from step_3_load_setup_model import setup_inference_pipeline
-from utils_gui.constants import SEEDS
+from utils_gui.constants import SEEDS, CONF_THRESH
 
 class EnsembleRunner:
-    def __init__(self, seeds, mode="both"):
+    def __init__(self, seeds, mode="both", threshold: float = 0.5):
         """
         seeds: list of random seeds
         mode: one of "pre_tta", "tta", or "both"
+        threshold: probability cutoff for positive class
         """
         self.mode = mode
         self._trial_idx = 0
+        self.threshold = threshold
 
         # build per‐seed engines
         self.pre_engines = {}
@@ -33,32 +35,53 @@ class EnsembleRunner:
         avg_pre = label_pre = probs_pre = None
         if self.mode in ("pre_tta", "both"):
             probs_pre = []
+            shp = None
             for eng in self.pre_engines.values():
-                p, _ = eng.infer(trial, self._trial_idx)   # returns (probs, R)
-                probs_pre.append(p.squeeze(0))
+                p, _, _ = eng.infer(trial, self._trial_idx)   # returns (probs, R)
+                p0 = np.take(p, 0, axis=0)  # always take first sample along axis0
+                if shp is None:
+                    shp = p0.shape
+                elif p0.shape != shp:
+                    raise ValueError(f"Per-seed prob shape mismatch: {p0.shape} vs {shp}")
+                probs_pre.append(p0.astype(np.float32))
             probs_pre = np.stack(probs_pre, axis=0)
             avg_pre = probs_pre.mean(axis=0)
-            label_pre = int(avg_pre[1] > 0.5)
+            label_pre = int(avg_pre[1] > self.threshold)
 
         # TTA ensemble
         avg_tta = label_tta = probs_tta = None
         if self.mode in ("tta", "both"):
             probs_tta = []
+            shp = None
             for eng in self.tta_engines.values():
                 p, _, _ = eng.infer(trial, self._trial_idx)  # returns (probs, R, buffer)
-                probs_tta.append(p.squeeze(0))
+                p0 = np.take(p, 0, axis=0)
+                if shp is None:
+                    shp = p0.shape
+                elif p0.shape != shp:
+                    raise ValueError(f"Per-seed prob shape mismatch: {p0.shape} vs {shp}")
+                probs_tta.append(p0.astype(np.float32))
             probs_tta = np.stack(probs_tta, axis=0)
             avg_tta = probs_tta.mean(axis=0)
-            label_tta = int(avg_tta[1] > 0.5)
+            label_tta = int(avg_tta[1] > self.threshold)
 
         self._trial_idx += 1
-        return label_pre, label_tta, avg_pre, avg_tta, probs_pre, probs_tta
+        if self.mode == "pre_tta":
+            return label_pre, avg_pre, probs_pre
+        elif self.mode == "tta":
+            return label_tta, avg_tta, probs_tta
+        else:  # both
+            return label_pre, label_tta, avg_pre, avg_tta, probs_pre, probs_tta
 
 
 if __name__ == "__main__":
-    runner = EnsembleRunner(seeds=SEEDS, mode="both")
-    data_dir = r"E:\Exoskeleton_DL\DeepTransferEEG\iplementaion_runn\penteng_2_20250702_151500"
-    files = sorted(glob.glob(os.path.join(data_dir, "trial_*_fixation.npy")))
+    runner = EnsembleRunner(seeds=SEEDS, mode="both", threshold=CONF_THRESH)
+    data_dir = r"E:\Exoskeleton_DL\DeepTransferEEG\iplementaion_runn\Yanfan_2_20250708_120102"
+    # sort by numeric trial index to ensure correct adaptation order
+    files = sorted(
+        glob.glob(os.path.join(data_dir, "trial_*_fixation.npy")),
+        key=lambda f: int(os.path.basename(f).split("_")[1]),
+    )
 
     # load and validate ground truth + predicted labels
     with open(os.path.join(data_dir, "trial_results.json"), "r") as jf:
@@ -87,7 +110,16 @@ if __name__ == "__main__":
         tidx = int(os.path.basename(f).split("_")[1])
         gt = gt_map[tidx]   # strict lookup
 
-        pre_lbl, tta_lbl, avg_pre, avg_tta, p_pre, p_tta = runner.predict(trial)
+        # unpack based on mode
+        if runner.mode == "both":
+            pre_lbl, tta_lbl, avg_pre, avg_tta, p_pre, p_tta = runner.predict(trial)
+        elif runner.mode == "pre_tta":
+            pre_lbl, avg_pre, p_pre = runner.predict(trial)
+            tta_lbl, avg_tta, p_tta = None, None, None
+        else:  # "tta"
+            tta_lbl, avg_tta, p_tta = runner.predict(trial)
+            pre_lbl, avg_pre, p_pre = None, None, None
+
         print(f"\nFile: {os.path.basename(f)}")
         if runner.mode in ("pre_tta", "both"):
             print(f"  Pre-TTA → label={pre_lbl}, avg_probs={avg_pre}")

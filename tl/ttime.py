@@ -595,7 +595,7 @@ def build_base_args(data_name, paradigm, N, chn, class_num,
     args.calc_time        = False
     args.max_parallel_seeds = 1
     # Fixed hyperparameters
-    args.max_tta          = 15
+    args.max_tta          = 10
     args.stride           = 1
     args.device           = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     args.data_env         = 'gpu' if torch.cuda.is_available() else 'local'
