@@ -76,7 +76,7 @@ class EnsembleRunner:
 
 if __name__ == "__main__":
     runner = EnsembleRunner(seeds=SEEDS, mode="both", threshold=CONF_THRESH)
-    data_dir = r"E:\Exoskeleton_DL\DeepTransferEEG\iplementaion_runn\Yanfan_2_20250708_120102"
+    data_dir = r"E:\Exoskeleton_DL\DeepTransferEEG\iplementaion_runn\shen_2_20250708_161905"
     # sort by numeric trial index to ensure correct adaptation order
     files = sorted(
         glob.glob(os.path.join(data_dir, "trial_*_fixation.npy")),
