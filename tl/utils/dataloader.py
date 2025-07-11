@@ -41,13 +41,10 @@ def data_process(dataset):
         sample_rate  = 100       # target downsample rate
         ch_num       = X.shape[1]
 
-        # 1) 50 Hz notch + 8–32 Hz bandpass at original rate
+        # 1) 50 Hz notch at original rate (skip initial 8–32 Hz bandpass)
         nyq = orig_sr / 2
         bn, an = iirnotch(50.0/nyq, 30.0)
-        b, a   = butter(5, [8/nyq, 32/nyq], btype='band')
         X = filtfilt(bn, an, X, axis=2)
-        X = filtfilt(b,  a,  X, axis=2)
-
         # 2) Downsample to 100 Hz
         X = X[:, :, ::2]
 
@@ -213,13 +210,10 @@ def data_process_secondsession(dataset):
         sample_rate  = 100        # target downsample rate
         ch_num       = X.shape[1]
 
-        # apply 8–32 Hz bandpass then 50 Hz notch at original rate
+        # apply 50 Hz notch at original rate (skip initial 8–32 Hz bandpass)
         nyq = orig_sr / 2
-        b, a   = butter(5, [8/nyq, 32/nyq], btype='band')
         bn, an = iirnotch(50.0/nyq, 30.0)
-        X = filtfilt(b, a,   X, axis=2)
         X = filtfilt(bn, an, X, axis=2)
-
         # downsample to 100 Hz
         X = X[:, :, ::2]
 
@@ -379,6 +373,12 @@ def read_mi_multi_source(args):
     return src_data, src_label, tar_data, tar_label
 
 
+def data_normalize(fea_de, norm_type):
+    if norm_type == 'zscore':
+        zscore = preprocessing.StandardScaler()
+        fea_de = zscore.fit_transform(fea_de)
+
+    return fea_de
 def data_normalize(fea_de, norm_type):
     if norm_type == 'zscore':
         zscore = preprocessing.StandardScaler()
