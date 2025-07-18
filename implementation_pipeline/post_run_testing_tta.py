@@ -2,9 +2,11 @@ import numpy as np
 import os
 import glob
 import json
+import mne
 
 from step_3_load_setup_model import setup_inference_pipeline
 from utils_gui.constants import SEEDS, CONF_THRESH
+from utils_gui.read_lsl import design_filters, process_block, ORIGINAL_RATE
 
 class EnsembleRunner:
     def __init__(self, seeds, mode="both", threshold: float = 0.5):
@@ -75,11 +77,16 @@ class EnsembleRunner:
 
 
 if __name__ == "__main__":
-    runner = EnsembleRunner(seeds=SEEDS, mode="both", threshold=CONF_THRESH)
-    data_dir = r"E:\Exoskeleton_DL\DeepTransferEEG\iplementaion_runn\Yanfan_2_20250708_120102"
-    # sort by numeric trial index to ensure correct adaptation order
+    Start_time_crop = 6
+    last_time_crop = 1.5
+    # design filters once for raw‐trial processing
+    b_notch, a_notch, sos_bp = design_filters()
+
+    runner   = EnsembleRunner(seeds=SEEDS, mode="both", threshold=CONF_THRESH)
+    data_dir = r"E:\Exoskeleton_DL\DeepTransferEEG\iplementaion_runn\Zair_3_20250630_160636"
+    # switch to raw‐trial EDF files
     files = sorted(
-        glob.glob(os.path.join(data_dir, "trial_*_fixation.npy")),
+        glob.glob(os.path.join(data_dir, "trial_*_raw.edf")),
         key=lambda f: int(os.path.basename(f).split("_")[1]),
     )
 
@@ -106,9 +113,22 @@ if __name__ == "__main__":
     n_pre = n_tta = 0
 
     for f in files:
-        trial = np.load(f)
+        # load raw EEG from EDF, transpose to (n_samples, n_channels)
+        raw_raw = mne.io.read_raw_edf(f, preload=True)
+        raw = raw_raw.get_data().T
+
+        # compute and print actual raw duration
+        raw_duration = raw.shape[0] / ORIGINAL_RATE
+        print(f"\nFile: {os.path.basename(f)} | Raw duration: {raw_duration:.2f}s")
+        # crop out first 6 s and last 2 s at original rate
+        start = int(Start_time_crop * ORIGINAL_RATE)
+        end   = raw.shape[0] - int(last_time_crop * ORIGINAL_RATE)
+        raw_cropped = raw[start:end]
+        # apply LSL processing: notch, bandpass, downsample, TF features
+        trial = process_block(raw_cropped, b_notch, a_notch, sos_bp)
+
         tidx = int(os.path.basename(f).split("_")[1])
-        gt = gt_map[tidx]   # strict lookup
+        gt   = gt_map[tidx]   # strict lookup
 
         # unpack based on mode
         if runner.mode == "both":
@@ -120,7 +140,6 @@ if __name__ == "__main__":
             tta_lbl, avg_tta, p_tta = runner.predict(trial)
             pre_lbl, avg_pre, p_pre = None, None, None
 
-        print(f"\nFile: {os.path.basename(f)}")
         if runner.mode in ("pre_tta", "both"):
             print(f"  Pre-TTA → label={pre_lbl}, avg_probs={avg_pre}")
             print(f"    per-seed: {p_pre}")

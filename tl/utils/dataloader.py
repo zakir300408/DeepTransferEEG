@@ -54,7 +54,7 @@ def data_process(dataset):
             (4.0, 7.0),    # theta
             (7.0, 13.0),   # alpha
             (13.0, 32.0),  # beta
-            (1.0, 40.0)    # full
+            (4.0, 40.0)    # full
         ]
         X_sum = np.zeros_like(X)
         for low, high in bands:
