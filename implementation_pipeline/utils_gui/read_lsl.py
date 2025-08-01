@@ -16,8 +16,8 @@ from scipy.signal import butter, iirnotch, sosfiltfilt, filtfilt, spectrogram
 from joblib import Parallel, delayed
 
 # name of the LabStreamingLayer stream
-# STREAM_NAME    = "iReW32_73"
-STREAM_NAME = "iReUSB32_32"
+# STREAM_NAME    = "iReW32_73"  #for wifi based
+STREAM_NAME = "iReUSB32_32"   #for usb based
 
 # sampling rates (Hz)
 ORIGINAL_RATE  = 500.0   # incoming
