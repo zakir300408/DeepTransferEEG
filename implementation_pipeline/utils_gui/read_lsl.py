@@ -16,7 +16,8 @@ from scipy.signal import butter, iirnotch, sosfiltfilt, filtfilt, spectrogram
 from joblib import Parallel, delayed
 
 # name of the LabStreamingLayer stream
-STREAM_NAME    = "iReW32_73"
+# STREAM_NAME    = "iReW32_73"
+STREAM_NAME = "iReUSB32_32"
 
 # sampling rates (Hz)
 ORIGINAL_RATE  = 500.0   # incoming
@@ -26,17 +27,17 @@ TARGET_RATE    = 100.0   # after downsampling
 TRIAL_DURATION = 4.0
 
 # Butterworth filter settings
-FILTER_ORDER   = 4
+FILTER_ORDER   = 5
 BANDPASS_FREQS = (8.0, 32.0)
 NOTCH_FREQ     = 50.0
 NOTCH_Q        = 30.0
 
 # filterbank bands (Hz)
 FILTERBANK_BANDS = [
-    (4.0, 7.0),    # theta
-    (7.0, 13.0),   # alpha
-    (13.0, 32.0),  # beta
-    (1.0, 40.0)    # full
+(4.0, 7.0),    # theta
+(7.0, 13.0),   # alpha
+(13.0, 32.0),  # beta
+(1.0, 40.0)    # full
 ]
 
 # spectrogram parameters
@@ -61,56 +62,97 @@ logger = logging.getLogger(__name__)
 
 
 def design_filters():
-    """Design the notch and bandpass filters at the original rate."""
-    b_notch, a_notch = iirnotch(NOTCH_FREQ, NOTCH_Q, ORIGINAL_RATE)
+    """
+    Design the 50 Hz notch and the 8–32 Hz band‑pass Butterworth filters
+    at the original (500 Hz) sampling rate.
+
+    Returns
+    -------
+    b_notch, a_notch : ndarray
+        Coefficients of the IIR notch filter for `scipy.signal.filtfilt`.
+    sos_bp : ndarray
+        Second‑order‑sections representation of the band‑pass filter for
+        `scipy.signal.sosfiltfilt`.
+    """
+    # 1. 50 Hz notch (IIR)
+    b_notch, a_notch = iirnotch(NOTCH_FREQ, NOTCH_Q, fs=ORIGINAL_RATE)
+
+    # 2. 8–32 Hz band‑pass (5th‑order Butterworth, SOS form)
     sos_bp = butter(
-        FILTER_ORDER, BANDPASS_FREQS,
-        btype="bandpass", fs=ORIGINAL_RATE,
-        output="sos"
+        FILTER_ORDER,
+        BANDPASS_FREQS,
+        btype='bandpass',
+        fs=ORIGINAL_RATE,
+        output='sos'
     )
+
     return b_notch, a_notch, sos_bp
 
 
-def process_block(raw_block, b_notch, a_notch, sos_bp):
-    """
-    1) zero-phase notch + 8–32 Hz bandpass on raw (500 Hz)
-    2) downsample to TARGET_RATE (100 Hz)
-    3) apply multi-band spectral-fusion filterbank (θ, α, β, full)
-    4) compute TF spectrogram per channel on the fused signal
-    5) flatten and concatenate TF features with the fused time-series
 
-    Returns: array of shape (channels, timepoints + freq_bins*time_bins)
+def process_block(raw_block: np.ndarray,
+                  b_notch: np.ndarray,
+                  a_notch: np.ndarray,
+                  sos_bp: np.ndarray) -> np.ndarray:
     """
-    # --- Step 1: notch & bandpass at original rate ---
+    Convert one 4‑s raw EEG trial (500 Hz) into the augmented feature
+    representation used by the CustomEpoch reference pipeline.
+
+    Pipeline
+    --------
+    1) 50 Hz notch  ➜  8–32 Hz band‑pass  (both zero‑phase) @500 Hz
+    2) Down‑sample to 100 Hz (integer decimation × 5)
+    3) Multi‑band spectral‑fusion filterbank (θ, α, β, full)
+    4) Channel‑wise spectrogram (magnitude) on the fused signal
+    5) Concatenate fused time‑series with TF features and z‑score
+       per channel.
+
+    Returns
+    -------
+    X_aug : ndarray, shape (channels,
+                            n_time_points + freq_bins × time_bins)
+        Augmented feature matrix for the trial.
+    """
+    # ---------------------------------------------------------------
+    # 1. 50 Hz notch  ➜  8–32 Hz band‑pass  (both zero‑phase) @500 Hz
+    # ---------------------------------------------------------------
     data_notch = filtfilt(b_notch, a_notch, raw_block, axis=0)
     data_bp    = sosfiltfilt(sos_bp, data_notch, axis=0)
 
-    # --- Step 2: downsample by integer decimation ---
-    decim   = int(round(ORIGINAL_RATE / TARGET_RATE))
-    data_ds = data_bp[::decim, :]  # shape (n_samples_ds, n_channels)
+    # ---------------------------------------------------------------
+    # 2. Down‑sample 500 → 100 Hz (decimate by 5)
+    # ---------------------------------------------------------------
+    decim   = int(round(ORIGINAL_RATE / TARGET_RATE))   # = 5
+    data_ds = data_bp[::decim, :]                       # (n_ds, ch)
 
-    # --- Step 3: filterbank spectral fusion ---
-    # X_fused: same shape as data_ds
+    # ---------------------------------------------------------------
+    # 3. Multi‑band spectral‑fusion filterbank
+    # ---------------------------------------------------------------
+    nyq_fb  = TARGET_RATE / 2.0                         # 50 Hz
     X_fused = np.zeros_like(data_ds)
-    nyq_fb  = TARGET_RATE / 2.0
-    for low, high in FILTERBANK_BANDS:
-        b, a = butter(FILTER_ORDER, [low/nyq_fb, high/nyq_fb], btype='band')
-        Xf    = filtfilt(b, a, data_ds, axis=0)
-        X_fused += Xf
-    X_fused /= len(FILTERBANK_BANDS)  # average
 
-    # --- Step 4: compute spectrogram features per channel ---
-    # get freq/time dims from first channel
-    _, _, S0 = spectrogram(
+    for low, high in FILTERBANK_BANDS:
+        b_fb, a_fb = butter(
+            FILTER_ORDER,
+            [low / nyq_fb, high / nyq_fb],
+            btype='band'
+        )
+        X_fused += filtfilt(b_fb, a_fb, data_ds, axis=0)
+
+    X_fused /= float(len(FILTERBANK_BANDS))             # average bands
+
+    # ---------------------------------------------------------------
+    # 4. Channel‑wise spectrogram (magnitude)
+    # ---------------------------------------------------------------
+    _, _, S0   = spectrogram(
         X_fused[:, 0],
         fs=TARGET_RATE,
         nperseg=NPERSEG,
         noverlap=NOVERLAP
     )
-    freq_bins, time_bins = S0.shape
+    freq_bins, time_bins = S0.shape                     # reference dims
 
-    # prepare channel-wise data
-    def _compute_sxx(x):
+    def _spectro(x):
         return spectrogram(
             x,
             fs=TARGET_RATE,
@@ -118,18 +160,21 @@ def process_block(raw_block, b_notch, a_notch, sos_bp):
             noverlap=NOVERLAP
         )[2]
 
-    # run in parallel across channels
-    X_ch = [X_fused[:, ch] for ch in range(X_fused.shape[1])]
     sxx_list = Parallel(n_jobs=-1)(
-        delayed(_compute_sxx)(X_ch[ch])
-        for ch in range(len(X_ch))
+        delayed(_spectro)(X_fused[:, ch]) for ch in range(X_fused.shape[1])
     )
-    tf_feats = np.stack(sxx_list)  # shape (n_channels, freq_bins, time_bins)
-    tf_flat  = tf_feats.reshape(X_fused.shape[1], -1)  # (n_channels, freq_bins*time_bins)
+    tf_feats = np.stack(sxx_list)                       # (ch, f, t)
+    tf_flat  = tf_feats.reshape(X_fused.shape[1], -1)   # (ch, f*t)
 
-    # --- Step 5: concatenate fused time-series + TF features ---
-    X_time = X_fused.T  # (n_channels, n_samples_ds)
-    X_aug  = np.concatenate([X_time, tf_flat], axis=1)  # (n_channels, n_samples_ds + freq_bins*time_bins)
+    # ---------------------------------------------------------------
+    # 5. Concatenate time‑series + TF; z‑score per channel
+    # ---------------------------------------------------------------
+    X_time = X_fused.T                                  # (ch, time)
+    X_aug  = np.concatenate([X_time, tf_flat], axis=1)  # (ch, feats)
+
+    median = np.median(X_aug, axis=1, keepdims=True)
+    stdev  = np.std   (X_aug, axis=1, keepdims=True) + 1e-8
+    X_aug  = (X_aug - median) / stdev
 
     return X_aug
 

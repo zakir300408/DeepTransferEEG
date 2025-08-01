@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QFileDialog, QMessageBox
 )
 from .ui_main_window import Ui_MainWindow
+from PySide6.QtWidgets import QLabel, QComboBox
 
 
 class UserInfoApp(QMainWindow):
@@ -14,6 +15,21 @@ class UserInfoApp(QMainWindow):
         super().__init__()
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+        self.out_dir = None
+
+        # Add arm side dropdown
+        self.ui.ArmSideLabel = QLabel("Arm Side:")
+        self.ui.ArmSideComboBox = QComboBox()
+        self.ui.ArmSideComboBox.addItems(["Left", "Right"])
+        self.ui.ArmSideComboBox.setCurrentText("Left")  # Default to left
+
+        # Add to layout (assuming there's a form layout or similar)
+        # Insert after existing form elements
+        layout = self.ui.centralwidget.layout()
+        if layout:
+            # Find a good position to insert the arm side selection
+            layout.addWidget(self.ui.ArmSideLabel)
+            layout.addWidget(self.ui.ArmSideComboBox)
 
         # disable Start until all required inputs + folder are set
         self.ui.StartButton.setEnabled(False)
@@ -31,8 +47,6 @@ class UserInfoApp(QMainWindow):
         self.ui.NumTrialsBox.textChanged.connect(self.update_start_button)
         self.ui.Female_radio.toggled.connect(self.update_start_button)
         self.ui.Male_radio.toggled.connect(self.update_start_button)
-
-        self.out_dir = None    # add this
 
     def browse_folder(self):
         # only show directories
@@ -153,6 +167,10 @@ class UserInfoApp(QMainWindow):
             "Success",
             f"Data saved to:\n{json_path}"
         )
+
+    def get_arm_side(self):
+        """Get the selected arm side."""
+        return self.ui.ArmSideComboBox.currentText().lower()
 
 
 if __name__ == "__main__":

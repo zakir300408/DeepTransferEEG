@@ -64,7 +64,14 @@ def main():
 
     # pass runner into manager
     manager = TrialManager(ui, runner)
-    ui.ui.StartButton.clicked.connect(manager.launch)
+    
+    # Modify the start button connection to ensure arm side is passed
+    def start_experiment():
+        ui.save_data()
+        manager.launch()
+    
+    ui.ui.StartButton.clicked.disconnect()
+    ui.ui.StartButton.clicked.connect(start_experiment)
     ui.show()
     sys.exit(app.exec())
 

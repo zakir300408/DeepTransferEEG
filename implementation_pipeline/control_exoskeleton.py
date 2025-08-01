@@ -47,10 +47,10 @@ if __name__ == "__main__":
     ch340_port = ControlExoskeleton.find_ch340_port()
     if ch340_port:
         exo = ControlExoskeleton(ch340_port)
-        for _ in range(5):
+        for _ in range(10):
             exo.send_hex(UP)
-            time.sleep(5)
+            time.sleep(12)
             exo.send_hex(DOWN)
-            time.sleep(5)
+            time.sleep(12)
     else:
         print("No CH340 device found. Please connect the device or check available ports.")

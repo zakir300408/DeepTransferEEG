@@ -51,6 +51,7 @@ class TrialWindow(QWidget):
 
         # central label for fixation, arrow, or GIF
         self.label = QLabel(self)
+        self.label.setStyleSheet("color: white")  # ensure all label text is white
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setScaledContents(True)  # <-- allow scaling to fill
         self.layout.addWidget(self.label)
